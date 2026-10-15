@@ -1,0 +1,15 @@
+from falkordb import FalkorDB
+
+# Database Credentials
+CLOUD_HOST = "r-6jissuruar.instance-gijzjhvh6.hc-7up0crkyn.ap-south-1.aws.f2e0a955bb84.cloud" 
+CLOUD_PORT = 52078
+CLOUD_USERNAME = "falkordb"                  
+CLOUD_PASSWORD = "AqpDbFC7hzL3"
+
+# Connect to database
+try:
+    db = FalkorDB(host=CLOUD_HOST, port=CLOUD_PORT, username=CLOUD_USERNAME, password=CLOUD_PASSWORD)
+    graph = db.select_graph("SigmaCompanyBrain")
+    print("Successfully connected to FalkorDB Cloud!")
+except Exception as e:
+    print(f"Connection failed: {e}")
