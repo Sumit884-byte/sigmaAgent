@@ -7,7 +7,7 @@ app = FastAPI(title="Sigma Agent API")
 CLOUD_HOST = "r-6jissuruar.instance-gijzjhvh6.hc-7up0crkyn.ap-south-1.aws.f2e0a955bb84.cloud" 
 CLOUD_PORT = 52078
 CLOUD_USERNAME = "falkordb"                  
-CLOUD_PASSWORD = "AqpDbFC7hzL3"
+CLOUD_PASSWORD = "password"
 
 # 2. Connect to database
 db = FalkorDB(host=CLOUD_HOST, port=CLOUD_PORT, username=CLOUD_USERNAME, password=CLOUD_PASSWORD)
