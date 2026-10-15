@@ -1,0 +1,20 @@
+[
+  {
+    "task_id": "T1",
+    "title": "Setup FalkorDB Cloud",
+    "developer": "Srushti",
+    "blocked_by": null
+  },
+  {
+    "task_id": "T2",
+    "title": "Build LLM Agent",
+    "developer": "Person 4",
+    "blocked_by": "T1"
+  },
+  {
+    "task_id": "T3",
+    "title": "Design Dashboard UI",
+    "developer": "Person 3",
+    "blocked_by": "T2"
+  }
+]
