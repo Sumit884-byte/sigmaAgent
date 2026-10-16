@@ -77,6 +77,32 @@ class FalkorDbIntegrationTests(unittest.TestCase):
         save_sync_progress(self.graph, self.channel_id, None, None)
         self.assertIsNone(sync_progress(self.graph, self.channel_id))
 
+    def test_unique_legacy_developer_is_reused_for_discord_author(self) -> None:
+        legacy_name = f"Legacy Assignee {self.suffix}"
+        discord_id = f"legacy-discord-user-{self.suffix}"
+        self.graph.query(
+            "MERGE (d:Developer {name: $name}) REMOVE d.discord_id",
+            {"name": legacy_name},
+        )
+        message_id = f"legacy-author-message-{self.suffix}"
+        import_messages(self.graph, [DiscordMessage(
+            id=message_id, channel_id=self.channel_id, author_id=discord_id,
+            author_name=legacy_name, content="Waiting for review.",
+        )])
+
+        result = self.graph.query(
+            "MATCH (d:Developer {name: $name}) RETURN count(d), "
+            "sum(CASE WHEN d.discord_id = $discord_id THEN 1 ELSE 0 END)",
+            {"name": legacy_name, "discord_id": discord_id},
+        ).result_set[0]
+        authored = self.graph.query(
+            "MATCH (d:Developer {discord_id: $discord_id})-[:AUTHORED]->"
+            "(:DiscordMessage {id: $message_id}) RETURN count(d)",
+            {"discord_id": discord_id, "message_id": message_id},
+        ).result_set[0][0]
+        self.assertEqual(result, [1, 1])
+        self.assertEqual(authored, 1)
+
     def test_authenticated_sync_and_task_retrieval_through_http_with_real_graph(self) -> None:
         channel_id = str(100_000_000_000_000_000 + uuid.uuid4().int % 800_000_000_000_000_000)
         base_id = 300_000_000_000_000_000 + uuid.uuid4().int % 600_000_000_000_000_000
@@ -106,7 +132,7 @@ class FalkorDbIntegrationTests(unittest.TestCase):
                 "content": f"{task_id} is blocked by synthetic API access dependency.",
                 "timestamp": (base_time + timedelta(seconds=value - base_id)).isoformat(),
                 "author": {"id": f"author-{self.suffix}", "username": "Synthetic Author"},
-            } for value in sorted(selected, reverse=True)[:limit]]
+            } for value in sorted(selected, reverse=after is None)[:limit]]
 
         async def exercise_api():
             async with httpx.AsyncClient(

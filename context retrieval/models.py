@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+DISCORD_CHANNEL_ID_PATTERN = r"^[0-9]{17,20}$"
+
 
 class DiscordMessage(BaseModel):
     id: str = Field(min_length=1)
@@ -33,5 +35,7 @@ class ContextRequest(BaseModel):
     task_id: str | None = Field(default=None, max_length=100)
     blocker: str | None = Field(default=None, max_length=500)
     assignee: str | None = Field(default=None, max_length=200)
-    channel_id: str | None = None
+    channel_id: str | None = Field(
+        default=None, min_length=17, max_length=20, pattern=DISCORD_CHANNEL_ID_PATTERN
+    )
     limit: int = Field(default=20, ge=1, le=100)

@@ -20,7 +20,7 @@ from graph_store import (
     connect_graph, import_messages, latest_message_id, oldest_message_id,
     retrieve_evidence, save_sync_progress, sync_progress,
 )
-from models import ContextRequest, DiscordMessage
+from models import DISCORD_CHANNEL_ID_PATTERN, ContextRequest, DiscordMessage
 
 app = FastAPI(title="Sigma Agent Context Retrieval API", version="0.2.0")
 DISCORD_API = "https://discord.com/api/v10"
@@ -28,7 +28,7 @@ MAX_MESSAGES = 100
 MAX_SYNC_MESSAGES = 10_000
 MAX_SYNC_PAGES = MAX_SYNC_MESSAGES // MAX_MESSAGES
 logger = logging.getLogger(__name__)
-CHANNEL_ID_PATTERN = r"^[0-9]{17,20}$"
+CHANNEL_ID_PATTERN = DISCORD_CHANNEL_ID_PATTERN
 
 
 def require_context_api_key(x_context_api_key: str | None = Header(default=None)) -> None:
@@ -123,23 +123,30 @@ def _collect_history(channel_id: str, max_messages: int, *, mode: str,
     if fetch_page is None:
         fetch_page = _fetch_messages
     baseline = progress[0] if progress else latest_id
-    cursor = progress[1] if progress else (oldest_id if mode == "backfill" else None)
+    cursor = progress[1] if progress else (
+        baseline if mode == "incremental" and baseline is not None
+        else oldest_id if mode == "backfill" else None
+    )
     collected: list[dict[str, Any]] = []
     pages = 0
     high_water = int(baseline) if baseline and baseline.isdigit() else None
     continuation: str | None = None
     while len(collected) < max_messages and pages < MAX_SYNC_PAGES:
         page_size = min(MAX_MESSAGES, max_messages - len(collected))
-        page = fetch_page(
-            channel_id,
-            page_size,
-            before=cursor if cursor is not None or pages > 0 else None,
-            after=baseline if mode == "incremental" and pages == 0 and progress is None else None,
-        )
+        if mode == "incremental" and baseline is not None:
+            # Discord returns the oldest messages after this snowflake first.
+            # Advance the lower bound with each page; using `before` here walks
+            # backward into history already stored in the graph.
+            page = fetch_page(channel_id, page_size, after=cursor or baseline)
+        else:
+            page = fetch_page(
+                channel_id,
+                page_size,
+                before=cursor if cursor is not None or pages > 0 else None,
+            )
         pages += 1
         if not page:
             break
-        boundary_hit = False
         for item in page:
             message_id = str(item.get("id", ""))
             is_new = mode != "incremental" or high_water is None or (
@@ -147,15 +154,17 @@ def _collect_history(channel_id: str, max_messages: int, *, mode: str,
             )
             if is_new:
                 collected.append(item)
-            elif mode == "incremental":
-                boundary_hit = True
         ids = [str(item.get("id", "")) for item in page if item.get("id")]
         if not ids:
             break
-        next_cursor = min(ids, key=lambda value: int(value) if value.isdigit() else 0)
+        next_cursor = (
+            max(ids, key=lambda value: int(value) if value.isdigit() else 0)
+            if mode == "incremental" and baseline is not None
+            else min(ids, key=lambda value: int(value) if value.isdigit() else 0)
+        )
         if cursor == next_cursor:
             break
-        if boundary_hit or len(page) < page_size:
+        if len(page) < page_size:
             break
         cursor = next_cursor
         if len(collected) >= max_messages:
@@ -306,8 +315,6 @@ def retrieve_context(
 ) -> dict[str, Any]:
     """Search imported Discord evidence using relevant Jira/Linear fields."""
     if request.channel_id is not None:
-        if not re.fullmatch(CHANNEL_ID_PATTERN, request.channel_id):
-            raise HTTPException(status_code=422, detail="channel_id must be a Discord snowflake")
         authorize_channel(request.channel_id)
     allowed_channels = allowed_channel_ids()
     terms = []

@@ -44,8 +44,10 @@ class ImporterTests(unittest.TestCase):
 
         self.assertEqual(counts, {"messages": 2, "evidence": 2, "task_links": 1})
         writes = [(query, params) for query, params in graph.queries if "UNWIND $items AS item" in query]
-        self.assertEqual(len(writes), 3)  # message write, stale-evidence cleanup, evidence write
-        self.assertTrue(all("MERGE" in query or "DELETE" in query for query, _ in writes))
+        self.assertEqual(len(writes), 5)
+        self.assertTrue(any("FOREACH" in query and "item.unambiguous" in query for query, _ in writes))
+        self.assertTrue(any("MERGE (a:Developer {discord_id: item.author_id})" in query
+                            for query, _ in writes))
 
     def test_reimport_is_safe_to_repeat_via_stable_merge_keys(self) -> None:
         graph = RecordingGraph()
@@ -126,8 +128,10 @@ class ImporterTests(unittest.TestCase):
             DiscordMessage(id="m-b", channel_id="c1", author_id="user-b", author_name="Same Name"),
         ]
         import_messages(graph, messages)
-        write_query = next(query for query, _ in graph.queries if "UNWIND $items AS item" in query)
-        self.assertIn("MERGE (a:Developer {discord_id: item.author_id})", write_query)
+        write_queries = [query for query, _ in graph.queries if "UNWIND $items AS item" in query]
+        self.assertTrue(any("MERGE (a:Developer {discord_id: item.author_id})" in query
+                            for query in write_queries))
+        self.assertTrue(any("item.unambiguous" in query for query in write_queries))
 
     def test_reimport_prunes_evidence_from_edited_message(self) -> None:
         graph = RecordingGraph()

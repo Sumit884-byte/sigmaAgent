@@ -10,7 +10,7 @@ def page(items: list[int]) -> list[dict[str, str]]:
 
 
 class CursorAwareDiscord:
-    """Fake Discord endpoint: newest-to-oldest, respecting after/before and limit."""
+    """Fake Discord: `after` pages ascend from the oldest matching message."""
 
     def __init__(self, ids: range):
         self.ids = list(ids)
@@ -23,7 +23,8 @@ class CursorAwareDiscord:
             selected = [value for value in selected if value < int(before)]
         if after is not None:
             selected = [value for value in selected if value > int(after)]
-        return page(sorted(selected, reverse=True)[:limit])
+        ordered = sorted(selected, reverse=after is None)
+        return page(ordered[:limit])
 
 
 class SyncPaginationTests(unittest.TestCase):
@@ -50,7 +51,8 @@ class SyncPaginationTests(unittest.TestCase):
         self.assertEqual(len(imported), len(set(imported)))
         self.assertEqual(pages, 3)  # final page also crosses the saved watermark
         self.assertEqual(discord.calls[0][2], "100")
-        self.assertEqual(discord.calls[1][1], "251")
+        self.assertEqual(discord.calls[1][1], None)
+        self.assertEqual([call[2] for call in discord.calls], ["100", "200", "300"])
         self.assertIsNone(saved_progress)
 
     def test_backfill_pages_older_messages_and_obeys_limit(self) -> None:

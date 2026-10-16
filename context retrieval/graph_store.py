@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from collections import Counter
 from typing import Any, Iterable
 
 from falkordb import FalkorDB
@@ -106,6 +107,38 @@ def import_messages(graph: Any, messages: list[DiscordMessage]) -> dict[str, int
         }
         for m in messages
     ]
+    author_items_by_id = {
+        item["author_id"]: {
+            "author_id": item["author_id"],
+            "author_name": item["author_name"],
+        }
+        for item in base_items
+    }
+    author_name_counts = Counter(item["author_name"] for item in author_items_by_id.values())
+    author_items = [
+        {
+            **item,
+            # Reuse a legacy name-only Developer only when the name identifies
+            # one Discord user in this import batch.
+            "unambiguous": author_name_counts[item["author_name"]] == 1,
+        }
+        for item in author_items_by_id.values()
+    ]
+    legacy_author_query = """
+    UNWIND $items AS item
+    OPTIONAL MATCH (identified:Developer {discord_id: item.author_id})
+    WITH item, count(identified) AS exact_matches
+    OPTIONAL MATCH (legacy:Developer {name: item.author_name})
+    WHERE exact_matches = 0
+      AND (legacy.discord_id IS NULL OR legacy.discord_id = item.author_id)
+    WITH item, exact_matches, collect(legacy) AS candidates
+    FOREACH (legacy IN CASE
+        WHEN exact_matches = 0 AND item.unambiguous AND size(candidates) = 1
+        THEN candidates ELSE [] END |
+        SET legacy.discord_id = item.author_id)
+    """
+    for batch in _chunks(author_items):
+        graph.query(legacy_author_query, {"items": batch})
     base_query = """
     UNWIND $items AS item
     MERGE (c:DiscordChannel {id: item.channel_id})
@@ -114,12 +147,18 @@ def import_messages(graph: Any, messages: list[DiscordMessage]) -> dict[str, int
     SET m.channel_id = item.channel_id, m.content = item.content,
         m.timestamp = item.timestamp, m.source_url = item.source_url
     MERGE (m)-[:IN_CHANNEL]->(c)
+    """
+    for batch in _chunks(base_items):
+        graph.query(base_query, {"items": batch})
+    author_query = """
+    UNWIND $items AS item
+    MATCH (m:DiscordMessage {id: item.message_id})
     MERGE (a:Developer {discord_id: item.author_id})
     SET a.name = item.author_name
     MERGE (a)-[:AUTHORED]->(m)
     """
     for batch in _chunks(base_items):
-        graph.query(base_query, {"items": batch})
+        graph.query(author_query, {"items": batch})
 
     evidence_items: list[dict[str, Any]] = []
     for message in messages:

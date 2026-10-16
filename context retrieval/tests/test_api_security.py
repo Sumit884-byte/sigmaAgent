@@ -76,7 +76,7 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
         channel_id = "123456789012345678"
         ids = list(range(1, 351))
         imported_ids: list[str] = []
-        progress = [("100", "251"), ("100", "151")]
+        progress = [("100", "200"), ("100", "300")]
 
         def fetch_messages(_channel, limit, *, before=None, after=None):
             selected = ids
@@ -85,7 +85,7 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
             if after is not None:
                 selected = [value for value in selected if value > int(after)]
             return [{"id": str(value), "content": "T2 is blocked by API access."}
-                    for value in sorted(selected, reverse=True)[:limit]]
+                    for value in sorted(selected, reverse=after is None)[:limit]]
 
         def fake_import(_graph, messages):
             imported_ids.extend(message.id for message in messages)
@@ -122,6 +122,21 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(imported_ids), {str(value) for value in range(101, 351)})
         self.assertEqual(len(imported_ids), len(set(imported_ids)))
         self.assertEqual(save_progress.call_count, 3)
+
+    async def test_retrieve_rejects_malformed_channel_id_via_request_model(self) -> None:
+        with patch.dict(os.environ, {
+            "CONTEXT_API_KEY": TEST_API_KEY,
+            "DISCORD_ALLOWED_CHANNEL_IDS": "123456789012345678",
+        }):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    "/context/retrieve",
+                    json={"feature_title": "Test", "channel_id": "not-a-channel"},
+                    headers={"X-Context-API-Key": TEST_API_KEY},
+                )
+        self.assertEqual(response.status_code, 422)
 
     async def test_database_errors_are_sanitized_from_api_responses(self) -> None:
         channel_id = "123456789012345678"

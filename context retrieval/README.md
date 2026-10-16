@@ -24,6 +24,10 @@ the same message repeatedly is idempotent. Re-importing an edited message also
 removes evidence no longer supported by its current content. History writes are
 grouped into batches of 250 messages to limit query overhead and memory use.
 Range indexes support channel watermarks and full-text search supports message retrieval.
+Discord authors use their Discord user ID as the stable identity. A legacy
+Person 2 `Developer {name}` record is adopted when that name uniquely identifies
+one developer and one Discord user in the import; ambiguous names remain
+separate rather than merging people incorrectly.
 The importer does not create or modify Person 2's `BLOCKED_BY` or `ASSIGNED_TO`
 relationships.
 
@@ -55,9 +59,10 @@ channel-history endpoints require `X-Context-API-Key`; requests are limited to
 allowlisted numeric Discord channel IDs. Retrieval also requires the API key.
 The bot requires View Channel and Read Message History permissions.
 
-Incremental sync walks Discord's newest-to-oldest pages and stores a separate
-per-channel continuation cursor plus the original high-water mark. If a sync
-hits its message cap before catching up, the next call resumes at the cursor;
+Incremental sync pages forward through Discord's `after` cursor, which returns
+the oldest messages after that ID first. It stores a separate per-channel
+continuation cursor plus the original high-water mark. If a sync hits its
+message cap before catching up, the next call resumes with `after=<last ID>`;
 the saved watermark advances only after the gap is filled. Backfill fetches
 older messages before the oldest stored message. Each call is capped at 10,000
 messages and Discord's 100-message page size. Discord rate limits honor
