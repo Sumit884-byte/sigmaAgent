@@ -19,7 +19,8 @@ with open('tasks.json', 'r') as file:
 for task in tasks_data:
     # Create Task and Developer nodes, and ASSIGNED_TO relationship
     query = """
-    MERGE (t:Task {id: $task_id, title: $title})
+    MERGE (t:Task {id: $task_id})
+SET t.title = $title
     MERGE (d:Developer {name: $developer})
     MERGE (d)-[:ASSIGNED_TO]->(t)
     """
