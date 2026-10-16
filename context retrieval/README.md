@@ -10,10 +10,12 @@ and graph credentials are not used or modified.
 ## Shared graph schema
 
 - `(:Task {id, title})` and `(:Developer {name})` are Person 2's existing nodes.
+- `(:DiscordAuthor {discord_id, discord_name})` stores Discord identity separately.
 - `(:DiscordChannel {id, name, guild_id, guild_name})`
 - `(:DiscordMessage {id, content, timestamp, source_url})`
 - `(:ContextEvidence {id, kind, excerpt, source_url})`
-- `(:Developer {discord_id})-[:AUTHORED]->(:DiscordMessage)`
+- `(:DiscordAuthor)-[:AUTHORED]->(:DiscordMessage)`
+- `(:DiscordAuthor)-[:MAPS_TO]->(:Developer)` only for configured identity mappings.
 - `(:DiscordMessage)-[:IN_CHANNEL]->(:DiscordChannel)`
 - `(:DiscordMessage)-[:SUPPORTS]->(:ContextEvidence)`
 - `(:ContextEvidence)-[:ABOUT]->(:Task)` only when the source message explicitly
@@ -24,16 +26,21 @@ the same message repeatedly is idempotent. Re-importing an edited message also
 removes evidence no longer supported by its current content. History writes are
 grouped into batches of 250 messages to limit query overhead and memory use.
 Range indexes support channel watermarks and full-text search supports message retrieval.
-Discord authors use their Discord user ID as the stable identity, and their
-current display name is stored in `discord_name`. The canonical `Developer.name`
-is set only when a Discord author node is first created; later Discord renames
-do not overwrite a Person 2 developer's name. To link an author to an existing
-Person 2 developer, set `DISCORD_DEVELOPER_MAP` to an explicit JSON object that
-maps Discord user IDs to exact developer names, for example
-`{"456789012345678901":"Srushti"}`. Name-only automatic matching is disabled
-because names can collide. A mapping resolves only when exactly one Developer
-has the configured name; otherwise the importer leaves the existing records
-unmodified and creates a separate Discord author node. `Developer.name` is
+Discord author records are separate from Person 2's `Developer` records, so
+syncs cannot rename ticket assignees or create duplicate Discord IDs on the
+Person 2 nodes. Historical `Developer {discord_id}` authors from older imports
+have their authored message edges transferred to `DiscordAuthor`. An author-only
+legacy node has its old Discord ID cleared and is marked so it cannot be
+mistaken for a Person 2 developer during mapping; a legacy node still used by
+task relationships keeps its existing properties.
+
+To link an author to an existing Person 2 developer, set
+`DISCORD_DEVELOPER_MAP` to an explicit JSON object mapping Discord user IDs to
+exact developer names, for example `{"456789012345678901":"Srushti"}`. The
+mapping can be added after the first sync; it creates a `MAPS_TO` edge without
+creating another author or mutating the developer name. Name-only automatic
+matching is disabled because names can collide. A mapping resolves only when
+exactly one non-legacy Developer has the configured name. `Developer.name` is
 indexed for these configured lookups.
 The importer does not create or modify Person 2's `BLOCKED_BY` or `ASSIGNED_TO`
 relationships.
@@ -109,6 +116,9 @@ Person 4 (or the bot caller) passes relevant fields returned by Person 2:
 
 The response includes the source message, extracted evidence excerpt, author,
 timestamp, task reference when explicit, and original Discord link.
+Hyphenated search terms such as `front-end` and `log-in` are split into safe
+full-text tokens so the search syntax does not interpret the hyphen as an
+exclusion operator.
 
 ### Direct channel search
 

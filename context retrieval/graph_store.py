@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import re
 import threading
 from typing import Any, Iterable
@@ -18,6 +18,7 @@ RANGE_INDEXES = {
     "DiscordChannel": ("id",),
     "DiscordMessage": ("id", "channel_id", "timestamp"),
     "Developer": ("discord_id", "name"),
+    "DiscordAuthor": ("discord_id",),
     "ContextEvidence": ("id",),
     "Task": ("id",),
     "DiscordSyncState": ("channel_id",),
@@ -115,10 +116,10 @@ def _discord_developer_map() -> dict[str, str]:
 
 def import_messages(graph: Any, messages: list[DiscordMessage]) -> dict[str, int]:
     """Idempotently import messages and evidence using bounded bulk queries."""
-    if not messages:
+    developer_map = _discord_developer_map()
+    if not messages and not developer_map:
         return {"messages": 0, "evidence": 0, "task_links": 0}
     tasks = task_catalog(graph)
-    developer_map = _discord_developer_map()
     base_items = [
         {
             "channel_id": m.channel_id, "channel_name": m.channel_name,
@@ -129,26 +130,38 @@ def import_messages(graph: Any, messages: list[DiscordMessage]) -> dict[str, int
         }
         for m in messages
     ]
-    author_items_by_id = {
-        item["author_id"]: {
-            "author_id": item["author_id"],
-            "author_name": item["author_name"],
-            "developer_name": developer_map.get(item["author_id"]),
-        }
+    # Reconcile the full configured mapping on every import. A mapping may be
+    # added after an author's last message was synced, so limiting this to the
+    # current batch would leave existing author nodes unmapped indefinitely.
+    identity_items_by_id = {
+        item["author_id"]: {"author_id": item["author_id"]}
         for item in base_items
     }
-    mapped_author_items = [item for item in author_items_by_id.values() if item["developer_name"]]
+    identity_items_by_id.update(
+        {discord_id: {"author_id": discord_id} for discord_id in developer_map}
+    )
+    identity_items = list(identity_items_by_id.values())
+    mapped_author_items = [
+        {"author_id": discord_id, "developer_name": developer_name}
+        for discord_id, developer_name in developer_map.items()
+    ]
     mapped_author_query = """
     UNWIND $items AS item
-    OPTIONAL MATCH (developer:Developer {name: item.developer_name})
-    WHERE developer.discord_id IS NULL OR developer.discord_id = item.author_id
-    WITH item, collect(developer) AS candidates
-    FOREACH (developer IN CASE WHEN size(candidates) = 1 THEN candidates ELSE [] END |
-        SET developer.discord_id = item.author_id,
-            developer.discord_name = item.author_name)
+    MATCH (author:DiscordAuthor {discord_id: item.author_id})
+    MATCH (developer:Developer {name: item.developer_name})
+    WITH author, collect(developer) AS all_candidates
+    WITH author, all_candidates,
+         [developer IN all_candidates WHERE developer.legacy_discord_author IS NULL]
+             AS canonical_candidates
+    WITH author, CASE WHEN size(canonical_candidates) > 0
+                      THEN canonical_candidates ELSE all_candidates END AS candidates
+    WHERE size(candidates) = 1
+    WITH author, candidates[0] AS developer
+    OPTIONAL MATCH (author)-[old:MAPS_TO]->(:Developer)
+    WITH author, developer, collect(old) AS old_links
+    FOREACH (old_link IN old_links | DELETE old_link)
+    MERGE (author)-[:MAPS_TO]->(developer)
     """
-    for batch in _chunks(mapped_author_items):
-        graph.query(mapped_author_query, {"items": batch})
     base_query = """
     UNWIND $items AS item
     MERGE (c:DiscordChannel {id: item.channel_id})
@@ -163,13 +176,37 @@ def import_messages(graph: Any, messages: list[DiscordMessage]) -> dict[str, int
     author_query = """
     UNWIND $items AS item
     MATCH (m:DiscordMessage {id: item.message_id})
-    MERGE (a:Developer {discord_id: item.author_id})
+    MERGE (a:DiscordAuthor {discord_id: item.author_id})
     ON CREATE SET a.name = item.author_name
     SET a.discord_name = item.author_name
     MERGE (a)-[:AUTHORED]->(m)
     """
     for batch in _chunks(base_items):
         graph.query(author_query, {"items": batch})
+    legacy_author_query = """
+    UNWIND $items AS item
+    MATCH (author:DiscordAuthor {discord_id: item.author_id})
+    OPTIONAL MATCH (legacy:Developer {discord_id: item.author_id})
+    WITH author, collect(legacy) AS legacy_nodes
+    UNWIND CASE WHEN size(legacy_nodes) = 0 THEN [null] ELSE legacy_nodes END AS legacy
+    OPTIONAL MATCH (legacy)-[old:AUTHORED]->(message:DiscordMessage)
+    WITH author, legacy, collect(message) AS messages, collect(old) AS old_edges
+    FOREACH (message IN messages | MERGE (author)-[:AUTHORED]->(message))
+    FOREACH (old_edge IN old_edges | DELETE old_edge)
+    WITH author, legacy
+    OPTIONAL MATCH (legacy)-[remaining]-()
+    WITH legacy, count(remaining) AS remaining_count
+    FOREACH (_ IN CASE
+        WHEN legacy IS NOT NULL AND remaining_count = 0 THEN [1] ELSE [] END |
+        REMOVE legacy.discord_id)
+    FOREACH (_ IN CASE
+        WHEN legacy IS NOT NULL AND remaining_count = 0 THEN [1] ELSE [] END |
+        SET legacy.legacy_discord_author = true)
+    """
+    for batch in _chunks(identity_items):
+        graph.query(legacy_author_query, {"items": batch})
+    for batch in _chunks(mapped_author_items):
+        graph.query(mapped_author_query, {"items": batch})
 
     evidence_items: list[dict[str, Any]] = []
     for message in messages:
@@ -268,7 +305,9 @@ def save_sync_progress(
 def _fulltext_query(terms: list[str]) -> str:
     tokens: list[str] = []
     for term in terms:
-        for token in re.findall(r"\w[\w-]{1,}", term, flags=re.UNICODE):
+        # RediSearch uses '-' as a negation operator. Split hyphenated terms
+        # into ordinary tokens instead of emitting an exclusion expression.
+        for token in re.findall(r"\w{2,}", term, flags=re.UNICODE):
             if token.casefold() not in {t.casefold() for t in tokens}:
                 tokens.append(token)
     return "|".join(tokens[:64])
@@ -290,13 +329,13 @@ def retrieve_evidence(
             """
             MATCH (task:Task {id: $task_id})<-[:ABOUT]-(e:ContextEvidence)
                   <-[:SUPPORTS]-(m:DiscordMessage)
-            OPTIONAL MATCH (author:Developer)-[:AUTHORED]->(m)
+            OPTIONAL MATCH (author:DiscordAuthor)-[:AUTHORED]->(m)
             OPTIONAL MATCH (m)-[:IN_CHANNEL]->(channel:DiscordChannel)
             WITH task, e, m, author, channel
             WHERE ($channel_id IS NULL OR channel.id = $channel_id)
               AND ($channel_ids IS NULL OR channel.id IN $channel_ids)
             RETURN m.id, m.content, m.timestamp, m.source_url,
-                   author.name, channel.id, channel.name,
+                   author.discord_name, channel.id, channel.name,
                    e.kind, e.excerpt, task.id, task.title, 1.0
             ORDER BY m.timestamp DESC
             LIMIT $limit
@@ -313,7 +352,7 @@ def retrieve_evidence(
             CALL db.idx.fulltext.queryNodes('DiscordMessage', $search) YIELD node, score
             WITH node AS m, score
             OPTIONAL MATCH (m)-[:SUPPORTS]->(e:ContextEvidence)
-            OPTIONAL MATCH (author:Developer)-[:AUTHORED]->(m)
+            OPTIONAL MATCH (author:DiscordAuthor)-[:AUTHORED]->(m)
             OPTIONAL MATCH (m)-[:IN_CHANNEL]->(channel:DiscordChannel)
             OPTIONAL MATCH (e)-[:ABOUT]->(task:Task)
             WITH m, e, author, channel, task, score
@@ -321,7 +360,7 @@ def retrieve_evidence(
               AND ($channel_id IS NULL OR channel.id = $channel_id)
               AND ($channel_ids IS NULL OR channel.id IN $channel_ids)
             RETURN m.id, m.content, m.timestamp, m.source_url,
-                   author.name, channel.id, channel.name,
+                   author.discord_name, channel.id, channel.name,
                    e.kind, e.excerpt, task.id, task.title, score
             ORDER BY score DESC, m.timestamp DESC
             LIMIT $limit

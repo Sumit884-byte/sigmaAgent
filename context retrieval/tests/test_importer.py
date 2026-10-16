@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from graph_store import BATCH_SIZE, import_messages, retrieve_evidence
+from graph_store import BATCH_SIZE, _fulltext_query, import_messages, retrieve_evidence
 from models import DiscordMessage
 
 
@@ -45,10 +45,10 @@ class ImporterTests(unittest.TestCase):
 
         self.assertEqual(counts, {"messages": 2, "evidence": 2, "task_links": 1})
         writes = [(query, params) for query, params in graph.queries if "UNWIND $items AS item" in query]
-        self.assertEqual(len(writes), 4)
-        self.assertTrue(any("MERGE (a:Developer {discord_id: item.author_id})" in query
+        self.assertEqual(len(writes), 5)
+        self.assertTrue(any("MERGE (a:DiscordAuthor {discord_id: item.author_id})" in query
                             for query, _ in writes))
-        author_query = next(query for query, _ in writes if "MERGE (a:Developer" in query)
+        author_query = next(query for query, _ in writes if "MERGE (a:DiscordAuthor" in query)
         self.assertIn("ON CREATE SET a.name = item.author_name", author_query)
         self.assertIn("SET a.discord_name = item.author_name", author_query)
 
@@ -132,7 +132,7 @@ class ImporterTests(unittest.TestCase):
         ]
         import_messages(graph, messages)
         write_queries = [query for query, _ in graph.queries if "UNWIND $items AS item" in query]
-        self.assertTrue(any("MERGE (a:Developer {discord_id: item.author_id})" in query
+        self.assertTrue(any("MERGE (a:DiscordAuthor {discord_id: item.author_id})" in query
                             for query in write_queries))
 
     def test_existing_developer_link_requires_explicit_discord_id_mapping(self) -> None:
@@ -152,8 +152,24 @@ class ImporterTests(unittest.TestCase):
         mapping_params = next(
             params for query, params in graph.queries if query == mapping_query
         )
-        self.assertIn("OPTIONAL MATCH (developer:Developer {name: item.developer_name})", mapping_query)
+        self.assertIn("MATCH (developer:Developer {name: item.developer_name})", mapping_query)
+        self.assertIn("MERGE (author)-[:MAPS_TO]->(developer)", mapping_query)
         self.assertEqual(mapping_params["items"][0]["developer_name"], "Person Two")
+
+    def test_fulltext_query_splits_hyphens_into_safe_tokens(self) -> None:
+        self.assertEqual(_fulltext_query(["front-end", "log-in"]), "front|end|log|in")
+
+    def test_new_mapping_is_reconciled_without_new_messages(self) -> None:
+        graph = RecordingGraph()
+        with patch.dict("os.environ", {
+            "DISCORD_DEVELOPER_MAP": '{"123456789012345678":"Person Two"}',
+        }):
+            counts = import_messages(graph, [])
+
+        self.assertEqual(counts, {"messages": 0, "evidence": 0, "task_links": 0})
+        queries = [query for query, _ in graph.queries]
+        self.assertTrue(any("MATCH (author:DiscordAuthor" in query for query in queries))
+        self.assertTrue(any("MERGE (author)-[:MAPS_TO]->(developer)" in query for query in queries))
 
     def test_reimport_prunes_evidence_from_edited_message(self) -> None:
         graph = RecordingGraph()

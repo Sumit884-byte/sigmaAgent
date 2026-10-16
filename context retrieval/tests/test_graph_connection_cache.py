@@ -43,6 +43,10 @@ class GraphConnectionCacheTests(unittest.TestCase):
             "CREATE INDEX FOR (n:Developer) ON (n.name)" in query
             for query in graph.queries
         ))
+        self.assertTrue(any(
+            "CREATE INDEX FOR (n:DiscordAuthor) ON (n.discord_id)" in query
+            for query in graph.queries
+        ))
         graph_store._GRAPH_CACHE.clear()
 
 

@@ -59,7 +59,7 @@ class FalkorDbIntegrationTests(unittest.TestCase):
             "The author is blocked by a deadline.",
         ))
         author_count = self.graph.query(
-            "MATCH (a:Developer) WHERE a.discord_id IN $ids RETURN count(DISTINCT a.discord_id)",
+            "MATCH (a:DiscordAuthor) WHERE a.discord_id IN $ids RETURN count(DISTINCT a.discord_id)",
             {"ids": [f"user-a-{self.suffix}", f"user-b-{self.suffix}"]},
         ).result_set[0][0]
         self.assertEqual(author_count, 2)
@@ -81,34 +81,85 @@ class FalkorDbIntegrationTests(unittest.TestCase):
     def test_explicit_legacy_mapping_preserves_canonical_name_on_discord_rename(self) -> None:
         legacy_name = f"Legacy Assignee {self.suffix}"
         discord_id = str(500_000_000_000_000_000 + uuid.uuid4().int % 400_000_000_000_000_000)
-        self.graph.query(
-            "MERGE (d:Developer {name: $name}) REMOVE d.discord_id",
-            {"name": legacy_name},
-        )
+        task_id = f"ASSIGNEE-TASK-{self.suffix}"
+        # Simulate the old implementation: both the Person 2 assignee and a
+        # Discord author record received the same discord_id.
+        self.graph.query("""
+            MERGE (task:Task {id: $task_id})
+            MERGE (canonical:Developer {name: $canonical_name, discord_id: $discord_id})
+            MERGE (task)-[:ASSIGNED_TO]->(canonical)
+            MERGE (message:DiscordMessage {id: $message_id})
+            CREATE (legacy:Developer {name: $canonical_name, discord_id: $discord_id})
+            MERGE (legacy)-[:AUTHORED]->(message)
+            """, {
+                "task_id": task_id, "canonical_name": legacy_name,
+                "discord_id": discord_id, "message_id": f"legacy-author-message-{self.suffix}",
+            })
         message_id = f"legacy-author-message-{self.suffix}"
         message = DiscordMessage(
             id=message_id, channel_id=self.channel_id, author_id=discord_id,
-            author_name="Discord Name Before", content="Waiting for review.",
+            author_name=legacy_name, content="Waiting for review.",
         )
+        # First import has no mapping; apply it later, as a real deployment may.
+        with patch.dict(os.environ, {"DISCORD_DEVELOPER_MAP": "{}"}):
+            import_messages(self.graph, [message])
         mapping = json.dumps({discord_id: legacy_name})
         with patch.dict(os.environ, {"DISCORD_DEVELOPER_MAP": mapping}):
-            import_messages(self.graph, [message])
+            # No new Discord messages are required for a newly added mapping
+            # to reconcile previously stored authorship and identity.
+            import_messages(self.graph, [])
             message.author_name = "Discord Name After"
             import_messages(self.graph, [message])
 
         result = self.graph.query(
-            "MATCH (d:Developer {name: $name}) RETURN count(d), "
-            "sum(CASE WHEN d.discord_id = $discord_id THEN 1 ELSE 0 END), "
-            "head(collect(d.discord_name))",
+            "MATCH (author:DiscordAuthor {discord_id: $discord_id})-[:MAPS_TO]->"
+            "(developer:Developer {name: $name}) "
+            "RETURN count(author), head(collect(author.discord_name)), "
+            "head(collect(developer.discord_id)), head(collect(developer.name))",
             {"name": legacy_name, "discord_id": discord_id},
         ).result_set[0]
         authored = self.graph.query(
-            "MATCH (d:Developer {discord_id: $discord_id})-[:AUTHORED]->"
+            "MATCH (d:DiscordAuthor {discord_id: $discord_id})-[:AUTHORED]->"
             "(:DiscordMessage {id: $message_id}) RETURN count(d)",
             {"discord_id": discord_id, "message_id": message_id},
         ).result_set[0][0]
-        self.assertEqual(result, [1, 1, "Discord Name After"])
+        old_developer_ids = self.graph.query(
+            "MATCH (d:Developer {discord_id: $discord_id}) RETURN count(d)",
+            {"discord_id": discord_id},
+        ).result_set[0][0]
+        legacy_authored = self.graph.query(
+            "MATCH (:Developer)-[:AUTHORED]->(:DiscordMessage {id: $message_id}) "
+            "RETURN count(*)",
+            {"message_id": message_id},
+        ).result_set[0][0]
+        self.assertEqual(result, [1, "Discord Name After", discord_id, legacy_name])
         self.assertEqual(authored, 1)
+        self.assertEqual(old_developer_ids, 1)  # preserve the assigned Person 2 record
+        self.assertEqual(legacy_authored, 0)
+
+    def test_delayed_mapping_links_when_discord_and_developer_names_differ(self) -> None:
+        developer_name = f"Canonical Assignee {self.suffix}"
+        discord_id = str(700_000_000_000_000_000 + uuid.uuid4().int % 200_000_000_000_000_000)
+        self.graph.query(
+            "MERGE (d:Developer {name: $name})", {"name": developer_name}
+        )
+        message = DiscordMessage(
+            id=f"different-name-{self.suffix}", channel_id=self.channel_id,
+            author_id=discord_id, author_name="Discord Display Name",
+            content="Ordinary update.",
+        )
+        import_messages(self.graph, [message])
+        with patch.dict(os.environ, {
+            "DISCORD_DEVELOPER_MAP": json.dumps({discord_id: developer_name}),
+        }):
+            import_messages(self.graph, [])
+
+        mapped = self.graph.query(
+            "MATCH (a:DiscordAuthor {discord_id: $discord_id})-[:MAPS_TO]->"
+            "(d:Developer {name: $name}) RETURN count(a), count(d)",
+            {"discord_id": discord_id, "name": developer_name},
+        ).result_set[0]
+        self.assertEqual(mapped, [1, 1])
 
     def test_name_collision_does_not_implicitly_claim_a_legacy_developer(self) -> None:
         legacy_name = f"Collision Name {self.suffix}"
@@ -129,13 +180,28 @@ class FalkorDbIntegrationTests(unittest.TestCase):
             "sum(CASE WHEN d.discord_id IS NULL THEN 1 ELSE 0 END)",
             {"name": legacy_name},
         ).result_set[0]
-        self.assertEqual(legacy, [2, 1])
+        self.assertEqual(legacy, [1, 1])
         discord_author = self.graph.query(
-            "MATCH (d:Developer {discord_id: $discord_id}) "
+            "MATCH (d:DiscordAuthor {discord_id: $discord_id}) "
             "RETURN d.name, d.discord_name",
             {"discord_id": discord_id},
         ).result_set[0]
         self.assertEqual(discord_author, [legacy_name, legacy_name])
+
+    def test_hyphenated_fulltext_terms_retrieve_matching_message(self) -> None:
+        message_id = f"hyphen-search-{self.suffix}"
+        message = DiscordMessage(
+            id=message_id, channel_id=self.channel_id,
+            author_id=f"author-{self.suffix}", author_name="Hyphen Author",
+            content="The front-end log-in flow is blocked by a missing service.",
+            source_url=f"https://discord.com/channels/g/{self.channel_id}/{message_id}",
+        )
+        import_messages(self.graph, [message])
+
+        results = retrieve_evidence(
+            self.graph, terms=["front-end", "log-in"], channel_id=self.channel_id, limit=10
+        )
+        self.assertTrue(any(item["message_id"] == message_id for item in results), results)
 
     def test_authenticated_sync_and_task_retrieval_through_http_with_real_graph(self) -> None:
         channel_id = str(100_000_000_000_000_000 + uuid.uuid4().int % 800_000_000_000_000_000)
