@@ -13,16 +13,17 @@ and graph credentials are not used or modified.
 - `(:DiscordChannel {id, name, guild_id, guild_name})`
 - `(:DiscordMessage {id, content, timestamp, source_url})`
 - `(:ContextEvidence {id, kind, excerpt, source_url})`
-- `(:Developer)-[:AUTHORED]->(:DiscordMessage)`
+- `(:Developer {discord_id})-[:AUTHORED]->(:DiscordMessage)`
 - `(:DiscordMessage)-[:IN_CHANNEL]->(:DiscordChannel)`
 - `(:DiscordMessage)-[:SUPPORTS]->(:ContextEvidence)`
 - `(:ContextEvidence)-[:ABOUT]->(:Task)` only when the source message explicitly
   references that task.
 
 Task and evidence identity use stable IDs, and imports use `MERGE`, so syncing
-the same message repeatedly is idempotent. History writes are grouped into
-batches of 250 messages to limit query overhead and memory use. Range indexes
-support channel watermarks and full-text search supports message retrieval.
+the same message repeatedly is idempotent. Re-importing an edited message also
+removes evidence no longer supported by its current content. History writes are
+grouped into batches of 250 messages to limit query overhead and memory use.
+Range indexes support channel watermarks and full-text search supports message retrieval.
 The importer does not create or modify Person 2's `BLOCKED_BY` or `ASSIGNED_TO`
 relationships.
 
@@ -37,6 +38,8 @@ real credentials.
 $env:FALKORDB_HOST = "127.0.0.1"
 $env:FALKORDB_PORT = "6379"
 $env:FALKORDB_GRAPH = "SigmaPerson3Test"
+$env:CONTEXT_API_KEY = "<long-random-service-key>"
+$env:DISCORD_ALLOWED_CHANNEL_IDS = "234567890123456789"
 python import_history.py                 # imports mock_discord_history.json
 python -m uvicorn api:app --host 127.0.0.1 --port 8001
 ```
@@ -46,21 +49,29 @@ The mock importer also copies only `Task` IDs and titles from Person 2's
 records for local evidence-link testing; it does not call or modify Person 2's
 API or cloud database.
 
-For live history, set `DISCORD_BOT_TOKEN`, then call
-`POST /context/sync-channel?channel_id=<id>&max_messages=500&mode=incremental`.
-Incremental sync fetches messages after the newest stored message; `mode=backfill`
-fetches older messages before the oldest stored message. Each call is capped at
-10,000 messages and Discord's 100-message page size. The bot requires View
-Channel and Read Message History permissions. This writes imported records only
-to the configured FalkorDB graph; it never sends Discord messages. Discord
-rate limits are retried using its `Retry-After` delay, with bounded retries for
-temporary server/network errors.
+Set `DISCORD_BOT_TOKEN`, a long random `CONTEXT_API_KEY`, and the comma-separated
+`DISCORD_ALLOWED_CHANNEL_IDS` before serving live requests. Sync and direct
+channel-history endpoints require `X-Context-API-Key`; requests are limited to
+allowlisted numeric Discord channel IDs. Retrieval also requires the API key.
+The bot requires View Channel and Read Message History permissions.
+
+Incremental sync walks Discord's newest-to-oldest pages and stores a separate
+per-channel continuation cursor plus the original high-water mark. If a sync
+hits its message cap before catching up, the next call resumes at the cursor;
+the saved watermark advances only after the gap is filled. Backfill fetches
+older messages before the oldest stored message. Each call is capped at 10,000
+messages and Discord's 100-message page size. Discord rate limits honor
+`Retry-After`; temporary server/network errors use bounded retries. Sync writes
+only to FalkorDB and never sends Discord messages.
 
 ## API
 
 ### Import channel history
 
 `POST /context/sync-channel?channel_id=<id>&max_messages=500&mode=incremental`
+
+Include the `X-Context-API-Key` header. `channel_id` must be a numeric Discord
+snowflake and must be in `DISCORD_ALLOWED_CHANNEL_IDS`.
 
 Reads a bounded page window from Discord, stores it in batches, extracts
 candidate evidence, and returns import counts and pages fetched. `max_messages`
@@ -89,7 +100,8 @@ timestamp, task reference when explicit, and original Discord link.
 ### Direct channel search
 
 `GET /context/channel-history?channel_id=<id>&query=<text>&limit=50` reads and
-ranks recent Discord messages without saving them. It does not post to Discord.
+ranks recent Discord messages without saving them. It requires the same API key
+header and channel allowlist. It does not post to Discord.
 
 ## Evidence extraction
 
@@ -101,14 +113,25 @@ message is not attached to a task by semantic guesswork.
 
 ## Tests
 
-From this directory, run `python -m unittest discover -s tests`. Tests cover
+Install service dependencies from this directory with `pip install -r requirements.txt`.
+Run `python -m unittest discover -s tests`. Tests cover
 explicit extraction, unsupported statements, task-link evidence, idempotent
 imports, bounded bulk writes for 1,001 mock messages, full-text retrieval, and
-incremental/backfill pagination. To exercise FalkorDB with the included fake
-history, run `python import_history.py` and query `/context/retrieve`.
+cursor-aware multi-call incremental/backfill pagination, API authentication,
+channel authorization, sanitized database errors, connection/index caching,
+stale-evidence cleanup, load-test graph safety, and task-title boundaries. To
+exercise FalkorDB with the included fake history, run `python import_history.py`
+and query `/context/retrieve` with its API key.
+
+To run the opt-in real FalkorDB integration tests against a dedicated graph,
+set `RUN_FALKORDB_INTEGRATION=1` and optionally
+`FALKORDB_INTEGRATION_GRAPH=SigmaPerson3IntegrationTest`, then run the same
+unittest command. The integration graph must use the `SigmaPerson3IntegrationTest`
+prefix; integration tests create uniquely named synthetic data in that graph.
 
 For an opt-in local database load test, run
-`python load_test_local.py --messages 10000`. It uses the separate
-`SigmaPerson3LoadTest` graph by default (or the graph named by
-`FALKORDB_GRAPH`) and generates synthetic records only. The run is repeatable
-because it uses stable IDs; use a fresh graph name for a clean import timing.
+`python load_test_local.py --messages 10000`. It always selects the separate
+`SigmaPerson3LoadTest` graph by default, regardless of `FALKORDB_GRAPH`; an
+explicit `--graph` must start with `SigmaPerson3LoadTest`. It generates
+synthetic records only. The run is repeatable because it uses stable IDs; use a
+fresh load-test graph name for a clean import timing.
