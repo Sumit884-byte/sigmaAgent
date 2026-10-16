@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
+import secrets
 import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlencode
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from graph_store import (
     connect_graph, import_messages, latest_message_id, oldest_message_id,
-    retrieve_evidence,
+    retrieve_evidence, save_sync_progress, sync_progress,
 )
 from models import ContextRequest, DiscordMessage
 
@@ -24,6 +27,35 @@ DISCORD_API = "https://discord.com/api/v10"
 MAX_MESSAGES = 100
 MAX_SYNC_MESSAGES = 10_000
 MAX_SYNC_PAGES = MAX_SYNC_MESSAGES // MAX_MESSAGES
+logger = logging.getLogger(__name__)
+CHANNEL_ID_PATTERN = r"^[0-9]{17,20}$"
+
+
+def require_context_api_key(x_context_api_key: str | None = Header(default=None)) -> None:
+    expected = os.getenv("CONTEXT_API_KEY")
+    if not expected or len(expected) < 32:
+        raise HTTPException(status_code=503, detail="Context API authentication is not configured")
+    if not x_context_api_key or not secrets.compare_digest(x_context_api_key, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+def allowed_channel_ids() -> list[str]:
+    allowed = {
+        value.strip()
+        for value in os.getenv("DISCORD_ALLOWED_CHANNEL_IDS", "").split(",")
+        if value.strip()
+    }
+    if not allowed:
+        raise HTTPException(status_code=503, detail="Discord channel allowlist is not configured")
+    if any(not re.fullmatch(CHANNEL_ID_PATTERN, channel_id) for channel_id in allowed):
+        raise HTTPException(status_code=503, detail="Discord channel allowlist is invalid")
+    return sorted(allowed)
+
+
+def authorize_channel(channel_id: str) -> None:
+    allowed = set(allowed_channel_ids())
+    if channel_id not in allowed:
+        raise HTTPException(status_code=403, detail="Channel is not allowed")
 
 
 def _discord_request(path: str, retries: int = 4) -> Any:
@@ -84,43 +116,59 @@ def _fetch_messages(channel_id: str, limit: int, *, before: str | None = None,
 def _collect_history(channel_id: str, max_messages: int, *, mode: str,
                      latest_id: str | None = None,
                      oldest_id: str | None = None,
-                     fetch_page: Any = _fetch_messages) -> tuple[list[dict[str, Any]], int]:
-    """Collect a bounded Discord history window, walking backward by snowflake."""
-    cursor = oldest_id if mode == "backfill" else None
-    after = latest_id if mode == "incremental" else None
+                     progress: tuple[str | None, str | None] | None = None,
+                     fetch_page: Any = None
+                     ) -> tuple[list[dict[str, Any]], int, str | None, str | None]:
+    """Collect bounded pages and return the persisted incremental continuation."""
+    if fetch_page is None:
+        fetch_page = _fetch_messages
+    baseline = progress[0] if progress else latest_id
+    cursor = progress[1] if progress else (oldest_id if mode == "backfill" else None)
     collected: list[dict[str, Any]] = []
     pages = 0
-    high_water = int(latest_id) if latest_id and latest_id.isdigit() else None
+    high_water = int(baseline) if baseline and baseline.isdigit() else None
+    continuation: str | None = None
     while len(collected) < max_messages and pages < MAX_SYNC_PAGES:
         page_size = min(MAX_MESSAGES, max_messages - len(collected))
-        page = fetch_page(channel_id, page_size, before=cursor,
-                          after=after if pages == 0 else None)
+        page = fetch_page(
+            channel_id,
+            page_size,
+            before=cursor if cursor is not None or pages > 0 else None,
+            after=baseline if mode == "incremental" and pages == 0 and progress is None else None,
+        )
         pages += 1
         if not page:
             break
-        # Discord pages are newest-to-oldest. Keep just newer items for incremental sync.
+        boundary_hit = False
         for item in page:
             message_id = str(item.get("id", ""))
-            if mode != "incremental" or high_water is None or not message_id.isdigit() or int(message_id) > high_water:
+            is_new = mode != "incremental" or high_water is None or (
+                message_id.isdigit() and int(message_id) > high_water
+            )
+            if is_new:
                 collected.append(item)
-                if len(collected) >= max_messages:
-                    break
+            elif mode == "incremental":
+                boundary_hit = True
         ids = [str(item.get("id", "")) for item in page if item.get("id")]
         if not ids:
             break
         next_cursor = min(ids, key=lambda value: int(value) if value.isdigit() else 0)
         if cursor == next_cursor:
             break
+        if boundary_hit or len(page) < page_size:
+            break
         cursor = next_cursor
-        if len(page) < page_size:
+        if len(collected) >= max_messages:
+            # First sync is a bounded recent-history bootstrap. During catch-up,
+            # persist the cursor and original watermark to avoid skipping a gap.
+            if mode == "incremental" and high_water is not None:
+                continuation = next_cursor
             break
-        if mode == "incremental" and high_water is not None and any(
-            value.isdigit() and int(value) <= high_water for value in ids
-        ):
-            break
-    # Older-page walking can return newest first; import chronologically for deterministic updates.
+    # A full last page is ambiguous at the exact cap; resume once more to confirm completion.
+    if pages >= MAX_SYNC_PAGES and cursor is not None and high_water is not None:
+        continuation = cursor
     collected.sort(key=lambda item: int(item.get("id", "0")) if str(item.get("id", "0")).isdigit() else 0)
-    return collected, pages
+    return collected, pages, baseline if continuation is not None else None, continuation
 
 
 def _discord_source_url(guild_id: str | None, channel_id: str, message_id: str) -> str:
@@ -152,6 +200,8 @@ def _raise_discord_error(exc: Exception) -> None:
     if isinstance(exc, RuntimeError):
         status = 503 if "not configured" in str(exc) or "Could not reach" in str(exc) else 502
         raise HTTPException(status_code=status, detail=str(exc)) from exc
+    logger.exception("Discord history request failed", exc_info=exc)
+    raise HTTPException(status_code=503, detail="Could not access Discord history") from exc
 
 
 @app.get("/health")
@@ -161,11 +211,13 @@ def health() -> dict[str, str]:
 
 @app.get("/context/channel-history")
 async def retrieve_channel_history(
-    channel_id: str = Query(min_length=1),
+    channel_id: str = Query(min_length=17, max_length=20, pattern=CHANNEL_ID_PATTERN),
     query: str = Query(min_length=1, max_length=500),
     limit: int = Query(default=50, ge=1, le=MAX_MESSAGES),
+    _authenticated: None = Depends(require_context_api_key),
 ) -> dict[str, Any]:
     """Read and rank recent Discord messages without writing to Discord."""
+    authorize_channel(channel_id)
     try:
         channel, messages = await asyncio.gather(
             asyncio.to_thread(_fetch_channel, channel_id),
@@ -173,6 +225,9 @@ async def retrieve_channel_history(
         )
     except (RuntimeError, PermissionError, LookupError) as exc:
         _raise_discord_error(exc)
+    except Exception as exc:
+        logger.exception("Discord channel history failed")
+        raise HTTPException(status_code=503, detail="Could not retrieve channel history") from exc
 
     terms = {word.casefold() for word in query.split() if len(word) > 1}
     ranked = []
@@ -201,33 +256,60 @@ async def retrieve_channel_history(
 
 @app.post("/context/sync-channel")
 async def sync_channel_history(
-    channel_id: str = Query(min_length=1),
+    channel_id: str = Query(min_length=17, max_length=20, pattern=CHANNEL_ID_PATTERN),
     max_messages: int = Query(default=500, ge=1, le=MAX_SYNC_MESSAGES),
     mode: str = Query(default="incremental", pattern="^(incremental|backfill)$"),
+    _authenticated: None = Depends(require_context_api_key),
 ) -> dict[str, Any]:
     """Incrementally sync or bounded-backfill Discord history into FalkorDB."""
+    authorize_channel(channel_id)
     try:
         channel = await asyncio.to_thread(_fetch_channel, channel_id)
+    except (RuntimeError, PermissionError, LookupError) as exc:
+        _raise_discord_error(exc)
+    except Exception as exc:
+        logger.exception("Could not read Discord channel")
+        raise HTTPException(status_code=503, detail="Could not read Discord channel") from exc
+    try:
         graph = await asyncio.to_thread(connect_graph)
         latest_id = await asyncio.to_thread(latest_message_id, graph, channel_id)
         oldest_id = await asyncio.to_thread(oldest_message_id, graph, channel_id)
-        raw_messages, pages = await asyncio.to_thread(
-            _collect_history, channel_id, max_messages, mode=mode,
-            latest_id=latest_id, oldest_id=oldest_id,
+        progress = (
+            await asyncio.to_thread(sync_progress, graph, channel_id)
+            if mode == "incremental" else None
         )
-    except (RuntimeError, PermissionError, LookupError) as exc:
-        _raise_discord_error(exc)
+        raw_messages, pages, baseline_id, cursor_id = await asyncio.to_thread(
+            _collect_history, channel_id, max_messages, mode=mode,
+            latest_id=latest_id, oldest_id=oldest_id, progress=progress,
+        )
+    except Exception as exc:
+        logger.exception("Could not prepare Discord history sync")
+        raise HTTPException(status_code=503, detail="Could not prepare history sync") from exc
     messages = [_to_model(raw, channel, channel_id) for raw in raw_messages if raw.get("id")]
     try:
         counts = await asyncio.to_thread(import_messages, graph, messages)
+        if mode == "incremental":
+            await asyncio.to_thread(save_sync_progress, graph, channel_id, baseline_id, cursor_id)
     except Exception as exc:
+        logger.exception("Could not import Discord history")
         raise HTTPException(status_code=503, detail="Could not import history into FalkorDB") from exc
-    return {"channel_id": channel_id, "mode": mode, "pages_fetched": pages, **counts}
+    return {
+        "channel_id": channel_id, "mode": mode, "pages_fetched": pages,
+        "sync_in_progress": cursor_id is not None, **counts,
+    }
 
 
 @app.post("/context/retrieve")
-def retrieve_context(request: ContextRequest) -> dict[str, Any]:
+def retrieve_context(
+    request: ContextRequest,
+    _authenticated: None = Depends(require_context_api_key),
+) -> dict[str, Any]:
     """Search imported Discord evidence using relevant Jira/Linear fields."""
+    if request.channel_id is not None:
+        if not re.fullmatch(CHANNEL_ID_PATTERN, request.channel_id):
+            raise HTTPException(status_code=422, detail="channel_id must be a Discord snowflake")
+        authorize_channel(request.channel_id)
+    allowed_channels = allowed_channel_ids()
     terms = []
     for value in (request.feature_title, request.blocker, request.assignee):
         if value:
@@ -238,9 +320,11 @@ def retrieve_context(request: ContextRequest) -> dict[str, Any]:
             terms=terms,
             task_id=request.task_id,
             channel_id=request.channel_id,
+            channel_ids=allowed_channels,
             limit=request.limit,
         )
     except Exception as exc:
+        logger.exception("Could not retrieve evidence from FalkorDB")
         raise HTTPException(status_code=503, detail="Could not retrieve evidence from FalkorDB") from exc
     return {
         "feature_title": request.feature_title,

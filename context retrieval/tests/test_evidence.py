@@ -37,6 +37,11 @@ class EvidenceExtractionTests(unittest.TestCase):
         self.assertEqual(explicit_task_reference(make_message("Build LLM Agent is blocked."), tasks), "T2")
         self.assertIsNone(explicit_task_reference(make_message("The integration is blocked."), tasks))
 
+    def test_task_title_uses_token_boundaries(self) -> None:
+        tasks = [{"id": "T3", "title": "Auth"}]
+        self.assertIsNone(explicit_task_reference(make_message("The author is blocked."), tasks))
+        self.assertEqual(explicit_task_reference(make_message("Auth is blocked."), tasks), "T3")
+
     def test_task_mentioned_elsewhere_in_message_does_not_link_unrelated_evidence(self) -> None:
         message = make_message("Decision: use staging. T2 can resume after access is confirmed.")
         decision = extract_evidence(message)[0]

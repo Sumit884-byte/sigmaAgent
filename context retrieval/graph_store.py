@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from typing import Any, Iterable
 
 from falkordb import FalkorDB
@@ -15,10 +16,13 @@ BATCH_SIZE = 250
 RANGE_INDEXES = {
     "DiscordChannel": ("id",),
     "DiscordMessage": ("id", "channel_id", "timestamp"),
-    "Developer": ("name",),
+    "Developer": ("discord_id",),
     "ContextEvidence": ("id",),
     "Task": ("id",),
+    "DiscordSyncState": ("channel_id",),
 }
+_GRAPH_CACHE: dict[tuple[str, int, str | None, str | None, str], Any] = {}
+_GRAPH_CACHE_LOCK = threading.Lock()
 
 
 def connect_graph() -> Any:
@@ -32,7 +36,14 @@ def connect_graph() -> Any:
         options["username"] = username
     if password:
         options["password"] = password
-    return FalkorDB(**options).select_graph(os.getenv("FALKORDB_GRAPH", "SigmaPerson3Test"))
+    graph_name = os.getenv("FALKORDB_GRAPH", "SigmaPerson3Test")
+    key = (options["host"], options["port"], username, password, graph_name)
+    with _GRAPH_CACHE_LOCK:
+        if key not in _GRAPH_CACHE:
+            graph = FalkorDB(**options).select_graph(graph_name)
+            ensure_indexes(graph)
+            _GRAPH_CACHE[key] = graph
+        return _GRAPH_CACHE[key]
 
 
 def ensure_indexes(graph: Any) -> None:
@@ -56,9 +67,17 @@ def ensure_indexes(graph: Any) -> None:
     for label, properties in RANGE_INDEXES.items():
         for prop in properties:
             if (label, prop, "RANGE") not in indexed:
-                graph.query(f"CREATE INDEX FOR (n:{label}) ON (n.{prop})")
+                _create_index(graph, f"CREATE INDEX FOR (n:{label}) ON (n.{prop})")
     if ("DiscordMessage", "content", "FULLTEXT") not in indexed:
-        graph.query("CALL db.idx.fulltext.createNodeIndex('DiscordMessage', 'content')")
+        _create_index(graph, "CALL db.idx.fulltext.createNodeIndex('DiscordMessage', 'content')")
+
+
+def _create_index(graph: Any, query: str) -> None:
+    try:
+        graph.query(query)
+    except Exception as exc:
+        if "already indexed" not in str(exc).casefold() and "index already exists" not in str(exc).casefold():
+            raise
 
 
 def task_catalog(graph: Any) -> list[dict[str, str]]:
@@ -76,7 +95,6 @@ def import_messages(graph: Any, messages: list[DiscordMessage]) -> dict[str, int
     """Idempotently import messages and evidence using bounded bulk queries."""
     if not messages:
         return {"messages": 0, "evidence": 0, "task_links": 0}
-    ensure_indexes(graph)
     tasks = task_catalog(graph)
     base_items = [
         {
@@ -84,7 +102,7 @@ def import_messages(graph: Any, messages: list[DiscordMessage]) -> dict[str, int
             "guild_id": m.guild_id, "guild_name": m.guild_name,
             "message_id": m.id, "content": m.content, "timestamp": m.timestamp,
             "source_url": m.source_url, "author_name": m.author_name,
-            "author_id": m.author_id,
+            "author_id": m.author_id or f"unknown:{m.author_name.casefold()}",
         }
         for m in messages
     ]
@@ -96,8 +114,8 @@ def import_messages(graph: Any, messages: list[DiscordMessage]) -> dict[str, int
     SET m.channel_id = item.channel_id, m.content = item.content,
         m.timestamp = item.timestamp, m.source_url = item.source_url
     MERGE (m)-[:IN_CHANNEL]->(c)
-    MERGE (a:Developer {name: item.author_name})
-    SET a.discord_id = item.author_id
+    MERGE (a:Developer {discord_id: item.author_id})
+    SET a.name = item.author_name
     MERGE (a)-[:AUTHORED]->(m)
     """
     for batch in _chunks(base_items):
@@ -112,6 +130,21 @@ def import_messages(graph: Any, messages: list[DiscordMessage]) -> dict[str, int
                 "source_url": evidence.source_url,
                 "task_id": explicit_task_reference(message, tasks, evidence.excerpt),
             })
+    evidence_by_message: dict[str, list[str]] = {message.id: [] for message in messages}
+    for item in evidence_items:
+        evidence_by_message[item["message_id"]].append(item["evidence_id"])
+    cleanup_items = [
+        {"message_id": message.id, "evidence_ids": evidence_by_message[message.id]}
+        for message in messages
+    ]
+    cleanup_query = """
+    UNWIND $items AS item
+    MATCH (m:DiscordMessage {id: item.message_id})-[:SUPPORTS]->(e:ContextEvidence)
+    WHERE NOT e.id IN item.evidence_ids
+    DETACH DELETE e
+    """
+    for batch in _chunks(cleanup_items):
+        graph.query(cleanup_query, {"items": batch})
     evidence_query = """
     UNWIND $items AS item
     MATCH (m:DiscordMessage {id: item.message_id})
@@ -154,6 +187,34 @@ def oldest_message_id(graph: Any, channel_id: str) -> str | None:
     return str(result.result_set[0][0]) if result.result_set and result.result_set[0][0] else None
 
 
+def sync_progress(graph: Any, channel_id: str) -> tuple[str | None, str | None] | None:
+    result = graph.query(
+        "MATCH (s:DiscordSyncState {channel_id: $channel_id}) "
+        "RETURN s.baseline_id, s.cursor_id LIMIT 1",
+        {"channel_id": channel_id},
+    )
+    if not result.result_set:
+        return None
+    row = result.result_set[0]
+    return (str(row[0]) if row[0] else None, str(row[1]) if row[1] else None)
+
+
+def save_sync_progress(
+    graph: Any, channel_id: str, baseline_id: str | None, cursor_id: str | None
+) -> None:
+    if cursor_id is None:
+        graph.query(
+            "MATCH (s:DiscordSyncState {channel_id: $channel_id}) DETACH DELETE s",
+            {"channel_id": channel_id},
+        )
+        return
+    graph.query(
+        "MERGE (s:DiscordSyncState {channel_id: $channel_id}) "
+        "SET s.baseline_id = $baseline_id, s.cursor_id = $cursor_id",
+        {"channel_id": channel_id, "baseline_id": baseline_id, "cursor_id": cursor_id},
+    )
+
+
 def _fulltext_query(terms: list[str]) -> str:
     tokens: list[str] = []
     for term in terms:
@@ -169,32 +230,69 @@ def retrieve_evidence(
     terms: list[str],
     task_id: str | None = None,
     channel_id: str | None = None,
+    channel_ids: list[str] | None = None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    """Use DiscordMessage's full-text index, then return source-backed context."""
+    """Search indexed message text and task-linked evidence, preserving sources."""
+    rows: list[Any] = []
+    if task_id:
+        task_result = graph.query(
+            """
+            MATCH (task:Task {id: $task_id})<-[:ABOUT]-(e:ContextEvidence)
+                  <-[:SUPPORTS]-(m:DiscordMessage)
+            OPTIONAL MATCH (author:Developer)-[:AUTHORED]->(m)
+            OPTIONAL MATCH (m)-[:IN_CHANNEL]->(channel:DiscordChannel)
+            WITH task, e, m, author, channel
+            WHERE ($channel_id IS NULL OR channel.id = $channel_id)
+              AND ($channel_ids IS NULL OR channel.id IN $channel_ids)
+            RETURN m.id, m.content, m.timestamp, m.source_url,
+                   author.name, channel.id, channel.name,
+                   e.kind, e.excerpt, task.id, task.title, 1.0
+            ORDER BY m.timestamp DESC
+            LIMIT $limit
+            """,
+            {"task_id": task_id, "channel_id": channel_id,
+             "channel_ids": channel_ids, "limit": limit},
+        )
+        rows.extend(task_result.result_set)
+
     search = _fulltext_query(terms)
-    if not search:
-        return []
-    ensure_indexes(graph)
-    result = graph.query(
-        """
-        CALL db.idx.fulltext.queryNodes('DiscordMessage', $search) YIELD node, score
-        WITH node AS m, score
-        OPTIONAL MATCH (m)-[:SUPPORTS]->(e:ContextEvidence)
-        OPTIONAL MATCH (author:Developer)-[:AUTHORED]->(m)
-        OPTIONAL MATCH (m)-[:IN_CHANNEL]->(channel:DiscordChannel)
-        OPTIONAL MATCH (e)-[:ABOUT]->(task:Task)
-        WITH m, e, author, channel, task, score
-        WHERE ($task_id IS NULL OR task.id = $task_id)
-          AND ($channel_id IS NULL OR channel.id = $channel_id)
-        RETURN m.id, m.content, m.timestamp, m.source_url,
-               author.name, channel.id, channel.name,
-               e.kind, e.excerpt, task.id, task.title, score
-        ORDER BY score DESC, m.timestamp DESC
-        LIMIT $limit
-        """,
-        {"search": search, "task_id": task_id, "channel_id": channel_id, "limit": limit},
-    )
+    if search:
+        result = graph.query(
+            """
+            CALL db.idx.fulltext.queryNodes('DiscordMessage', $search) YIELD node, score
+            WITH node AS m, score
+            OPTIONAL MATCH (m)-[:SUPPORTS]->(e:ContextEvidence)
+            OPTIONAL MATCH (author:Developer)-[:AUTHORED]->(m)
+            OPTIONAL MATCH (m)-[:IN_CHANNEL]->(channel:DiscordChannel)
+            OPTIONAL MATCH (e)-[:ABOUT]->(task:Task)
+            WITH m, e, author, channel, task, score
+            WHERE ($task_id IS NULL OR task.id = $task_id)
+              AND ($channel_id IS NULL OR channel.id = $channel_id)
+              AND ($channel_ids IS NULL OR channel.id IN $channel_ids)
+            RETURN m.id, m.content, m.timestamp, m.source_url,
+                   author.name, channel.id, channel.name,
+                   e.kind, e.excerpt, task.id, task.title, score
+            ORDER BY score DESC, m.timestamp DESC
+            LIMIT $limit
+            """,
+            {"search": search, "task_id": task_id, "channel_id": channel_id,
+             "channel_ids": channel_ids, "limit": limit},
+        )
+        rows.extend(result.result_set)
+
+    unique_rows: dict[tuple[Any, Any], Any] = {}
+    for row in rows:
+        unique_rows[(row[0], row[8])] = row
+    rows = sorted(
+        unique_rows.values(),
+        key=lambda row: (
+            bool(task_id and row[9] == task_id),
+            float(row[11] or 0),
+            str(row[2] or ""),
+        ),
+        reverse=True,
+    )[:limit]
     return [
         {
             "message_id": row[0], "content": row[1], "timestamp": row[2],
@@ -203,5 +301,5 @@ def retrieve_evidence(
             "evidence_excerpt": row[8], "task_id": row[9], "task_title": row[10],
             "relevance_score": row[11],
         }
-        for row in result.result_set
+        for row in rows
     ]

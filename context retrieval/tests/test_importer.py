@@ -43,9 +43,9 @@ class ImporterTests(unittest.TestCase):
         counts = import_messages(graph, messages)
 
         self.assertEqual(counts, {"messages": 2, "evidence": 2, "task_links": 1})
-        writes = [(query, params) for query, params in graph.queries if "UNWIND $items" in query]
-        self.assertEqual(len(writes), 2)  # one message batch and one evidence batch
-        self.assertTrue(all("MERGE" in query for query, _ in writes))
+        writes = [(query, params) for query, params in graph.queries if "UNWIND $items AS item" in query]
+        self.assertEqual(len(writes), 3)  # message write, stale-evidence cleanup, evidence write
+        self.assertTrue(all("MERGE" in query or "DELETE" in query for query, _ in writes))
 
     def test_reimport_is_safe_to_repeat_via_stable_merge_keys(self) -> None:
         graph = RecordingGraph()
@@ -67,7 +67,10 @@ class ImporterTests(unittest.TestCase):
             for i in range(1001)
         ]
         counts = import_messages(graph, messages)
-        write_batches = [params["items"] for query, params in graph.queries if "UNWIND $items" in query]
+        write_batches = [
+            params["items"] for query, params in graph.queries
+            if "MERGE (m:DiscordMessage" in query
+        ]
 
         self.assertEqual(counts["messages"], 1001)
         self.assertEqual(len(write_batches), 5)  # ceil(1001 / 250) message batches; no evidence
@@ -97,6 +100,49 @@ class ImporterTests(unittest.TestCase):
         self.assertEqual(graph.params["task_id"], "T2")
         self.assertIn("db.idx.fulltext.queryNodes", graph.query_text)
         self.assertEqual(graph.params["search"], "T2|API|key")
+
+    def test_task_id_alone_queries_linked_evidence(self) -> None:
+        class TaskGraph:
+            def query(self, query, params=None):
+                self.query_text = query
+                self.params = params or {}
+                return QueryResult([[
+                    "m-task", "T2 is blocked by a key.", "2026-10-15T10:30:00Z",
+                    "https://discord.com/channels/g1/c1/m-task", "Dev", "c1",
+                    "project", "blocker_candidate", "T2 is blocked by a key.",
+                    "T2", "Build LLM Agent", 1.0,
+                ]])
+
+        graph = TaskGraph()
+        results = retrieve_evidence(graph, terms=[], task_id="T2", limit=10)
+        self.assertEqual(results[0]["task_id"], "T2")
+        self.assertIn("ABOUT", graph.query_text)
+        self.assertEqual(graph.params["task_id"], "T2")
+
+    def test_import_keys_authors_by_discord_id(self) -> None:
+        graph = RecordingGraph()
+        messages = [
+            DiscordMessage(id="m-a", channel_id="c1", author_id="user-a", author_name="Same Name"),
+            DiscordMessage(id="m-b", channel_id="c1", author_id="user-b", author_name="Same Name"),
+        ]
+        import_messages(graph, messages)
+        write_query = next(query for query, _ in graph.queries if "UNWIND $items AS item" in query)
+        self.assertIn("MERGE (a:Developer {discord_id: item.author_id})", write_query)
+
+    def test_reimport_prunes_evidence_from_edited_message(self) -> None:
+        graph = RecordingGraph()
+        message = DiscordMessage(
+            id="edited", channel_id="c1", author_id="user1", author_name="Dev",
+            content="T2 is blocked by a missing key.",
+        )
+        import_messages(graph, [message])
+        message.content = "The key is available now."
+        import_messages(graph, [message])
+        cleanup_batches = [
+            params["items"] for query, params in graph.queries
+            if "DETACH DELETE e" in query
+        ]
+        self.assertEqual(cleanup_batches[-1], [{"message_id": "edited", "evidence_ids": []}])
 
 
 if __name__ == "__main__":

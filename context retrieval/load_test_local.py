@@ -1,8 +1,4 @@
-"""Run a bounded synthetic import/retrieval load against an isolated graph.
-
-Usage: python load_test_local.py --messages 10000
-Set FALKORDB_GRAPH to choose another disposable FalkorDB graph.
-"""
+"""Run a bounded synthetic import/retrieval load against an isolated graph."""
 
 from __future__ import annotations
 
@@ -14,15 +10,25 @@ from graph_store import connect_graph, import_messages, retrieve_evidence
 from models import DiscordMessage
 
 
+def configure_load_graph(graph_name: str) -> None:
+    if not graph_name.startswith("SigmaPerson3LoadTest"):
+        raise ValueError("load-test graph must start with SigmaPerson3LoadTest")
+    os.environ["FALKORDB_GRAPH"] = graph_name
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--messages", type=int, default=10_000)
     parser.add_argument("--channel", default="synthetic-load-test")
+    parser.add_argument("--graph", default="SigmaPerson3LoadTest")
     args = parser.parse_args()
     if not 1 <= args.messages <= 50_000:
         parser.error("--messages must be between 1 and 50000")
+    try:
+        configure_load_graph(args.graph)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    os.environ.setdefault("FALKORDB_GRAPH", "SigmaPerson3LoadTest")
     graph = connect_graph()
     graph.query("MERGE (t:Task {id: 'LOAD-T1'}) SET t.title = 'Synthetic load test task'")
     messages = []

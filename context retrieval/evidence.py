@@ -54,11 +54,16 @@ def explicit_task_reference(
     """Return a task ID only when the evidence sentence names it explicitly."""
     text = statement if statement is not None else message.content
     content = text.casefold()
+    content_tokens = re.findall(r"\w+", content, flags=re.UNICODE)
     for task in tasks:
         task_id = str(task.get("id") or "")
         title = str(task.get("title") or "")
         if task_id and re.search(rf"(?<![\w-]){re.escape(task_id)}(?![\w-])", text, re.IGNORECASE):
             return task_id
-        if title and title.casefold() in content:
+        title_tokens = re.findall(r"\w+", title.casefold(), flags=re.UNICODE)
+        if title_tokens and any(
+            content_tokens[index:index + len(title_tokens)] == title_tokens
+            for index in range(len(content_tokens) - len(title_tokens) + 1)
+        ):
             return task_id or None
     return None

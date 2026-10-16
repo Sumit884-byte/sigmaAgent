@@ -9,52 +9,70 @@ def page(items: list[int]) -> list[dict[str, str]]:
     return [{"id": str(item), "content": f"message-{item}"} for item in items]
 
 
+class CursorAwareDiscord:
+    """Fake Discord endpoint: newest-to-oldest, respecting after/before and limit."""
+
+    def __init__(self, ids: range):
+        self.ids = list(ids)
+        self.calls = []
+
+    def fetch(self, _channel, limit, *, before=None, after=None):
+        self.calls.append((limit, before, after))
+        selected = self.ids
+        if before is not None:
+            selected = [value for value in selected if value < int(before)]
+        if after is not None:
+            selected = [value for value in selected if value > int(after)]
+        return page(sorted(selected, reverse=True)[:limit])
+
+
 class SyncPaginationTests(unittest.TestCase):
+    def test_incremental_sync_resumes_capped_backlog_until_watermark(self) -> None:
+        discord = CursorAwareDiscord(range(1, 351))
+        saved_progress = None
+        imported: list[str] = []
+        pages = 0
+
+        # Simulate repeated endpoint calls, each capped at 100 messages.
+        for _ in range(5):
+            messages, call_pages, next_baseline, next_cursor = _collect_history(
+                "123456789012345678", 100, mode="incremental",
+                latest_id="100", progress=saved_progress, fetch_page=discord.fetch,
+            )
+            pages += call_pages
+            imported.extend(item["id"] for item in messages)
+            saved_progress = (next_baseline, next_cursor) if next_cursor else None
+            if saved_progress is None:
+                break
+
+        self.assertEqual(len(imported), 250)
+        self.assertEqual(set(imported), {str(value) for value in range(101, 351)})
+        self.assertEqual(len(imported), len(set(imported)))
+        self.assertEqual(pages, 3)  # final page also crosses the saved watermark
+        self.assertEqual(discord.calls[0][2], "100")
+        self.assertEqual(discord.calls[1][1], "251")
+        self.assertIsNone(saved_progress)
+
     def test_backfill_pages_older_messages_and_obeys_limit(self) -> None:
-        calls = []
-        pages = {None: page(list(range(100, 0, -1))), "1": page([])}
-
-        def fetch(_channel, limit, *, before=None, after=None):
-            calls.append((limit, before, after))
-            return pages.get(before, [])[:limit]
-
-        messages, page_count = _collect_history(
-            "channel", 120, mode="backfill", fetch_page=fetch
+        discord = CursorAwareDiscord(range(1, 101))
+        messages, page_count, _, _ = _collect_history(
+            "123456789012345678", 120, mode="backfill", fetch_page=discord.fetch
         )
 
         self.assertEqual(len(messages), 100)
         self.assertEqual(page_count, 2)
-        self.assertEqual(calls[0], (100, None, None))
-        self.assertEqual(calls[1][1], "1")
+        self.assertEqual(discord.calls, [(100, None, None), (20, "1", None)])
         self.assertEqual(messages[0]["id"], "1")
 
-    def test_incremental_sync_stops_at_saved_watermark(self) -> None:
-        calls = []
-        response = page([110, 109, 108, 107, 106, 105, 104, 103, 102, 101, 100, 99])
-
-        def fetch(_channel, limit, *, before=None, after=None):
-            calls.append((limit, before, after))
-            return response[:limit]
-
-        messages, page_count = _collect_history(
-            "channel", 100, mode="incremental", latest_id="100", fetch_page=fetch
+    def test_initial_incremental_bootstrap_is_bounded(self) -> None:
+        discord = CursorAwareDiscord(range(1, 351))
+        messages, _, baseline, cursor = _collect_history(
+            "123456789012345678", 75, mode="incremental", fetch_page=discord.fetch
         )
-
-        self.assertEqual([item["id"] for item in messages], ["101", "102", "103", "104", "105", "106", "107", "108", "109", "110"])
-        self.assertEqual(page_count, 1)
-        self.assertEqual(calls[0][2], "100")
-
-    def test_history_window_is_capped_by_requested_message_count(self) -> None:
-        calls = []
-
-        def fetch(_channel, limit, *, before=None, after=None):
-            calls.append(limit)
-            start = 1000 if before is None else int(before) - 1
-            return page(list(range(start, start - limit, -1)))
-
-        messages, _ = _collect_history("channel", 175, mode="backfill", fetch_page=fetch)
-        self.assertEqual(len(messages), 175)
-        self.assertEqual(calls, [100, 75])
+        self.assertEqual(len(messages), 75)
+        self.assertIsNone(baseline)
+        self.assertIsNone(cursor)
+        self.assertEqual(discord.calls, [(75, None, None)])
 
 
 if __name__ == "__main__":
