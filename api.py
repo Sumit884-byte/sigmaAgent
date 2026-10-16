@@ -19,8 +19,9 @@ def get_task_dependencies():
     # Query the graph for all blocking relationships
     query = """
     MATCH (t:Task)-[:BLOCKED_BY]->(b:Task)
-    MATCH (d:Developer)-[:ASSIGNED_TO]->(b)
-    RETURN t.title, b.title, d.name
+OPTIONAL MATCH (d:Developer)-[:ASSIGNED_TO]->(b)
+RETURN t.title, b.title, d.name
+
     """
     result = graph.query(query)
     
