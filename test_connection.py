@@ -9,7 +9,7 @@ CLOUD_PASSWORD = "password"
 # Connect to database
 try:
     db = FalkorDB(host=CLOUD_HOST, port=CLOUD_PORT, username=CLOUD_USERNAME, password=CLOUD_PASSWORD)
-    graph = db.select_graph("SigmaCompanyBrain")
-    print("Successfully connected to FalkorDB Cloud!")
-except Exception as e:
-    print(f"Connection failed: {e}")
+graph = db.select_graph("SigmaCompanyBrain")
+graph.query("RETURN 1") # <--- Add this line to force network validation
+print("Successfully connected to FalkorDB Cloud!")
+
