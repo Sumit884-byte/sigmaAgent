@@ -4,8 +4,11 @@
    and credentials with environment variables. Do not reuse Person 2's password
    or edit their root API/ingestion files.
 2. **Use the shared schema.** Read existing `Task` nodes and `Developer` names
-   from the graph. Add Discord-specific channel, message, and evidence nodes;
-   use `Developer` for authorship so existing people can be reused.
+   from the graph. Add Discord-specific channel, message, and evidence nodes.
+   Use `Developer` for authorship; link an existing person only through the
+   explicit `DISCORD_DEVELOPER_MAP` Discord-user-ID-to-developer-name setting.
+   Keep Discord's current display name in `discord_name`, preserving the
+   canonical Person 2 `name` field.
 3. **Import history idempotently.** Import the mock fixture with
    `python import_history.py`. It copies Person 2's mock Task IDs/titles into
    the isolated test graph so task evidence can be linked locally, then imports

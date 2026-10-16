@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import asyncio
+import json
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -77,22 +78,28 @@ class FalkorDbIntegrationTests(unittest.TestCase):
         save_sync_progress(self.graph, self.channel_id, None, None)
         self.assertIsNone(sync_progress(self.graph, self.channel_id))
 
-    def test_unique_legacy_developer_is_reused_for_discord_author(self) -> None:
+    def test_explicit_legacy_mapping_preserves_canonical_name_on_discord_rename(self) -> None:
         legacy_name = f"Legacy Assignee {self.suffix}"
-        discord_id = f"legacy-discord-user-{self.suffix}"
+        discord_id = str(500_000_000_000_000_000 + uuid.uuid4().int % 400_000_000_000_000_000)
         self.graph.query(
             "MERGE (d:Developer {name: $name}) REMOVE d.discord_id",
             {"name": legacy_name},
         )
         message_id = f"legacy-author-message-{self.suffix}"
-        import_messages(self.graph, [DiscordMessage(
+        message = DiscordMessage(
             id=message_id, channel_id=self.channel_id, author_id=discord_id,
-            author_name=legacy_name, content="Waiting for review.",
-        )])
+            author_name="Discord Name Before", content="Waiting for review.",
+        )
+        mapping = json.dumps({discord_id: legacy_name})
+        with patch.dict(os.environ, {"DISCORD_DEVELOPER_MAP": mapping}):
+            import_messages(self.graph, [message])
+            message.author_name = "Discord Name After"
+            import_messages(self.graph, [message])
 
         result = self.graph.query(
             "MATCH (d:Developer {name: $name}) RETURN count(d), "
-            "sum(CASE WHEN d.discord_id = $discord_id THEN 1 ELSE 0 END)",
+            "sum(CASE WHEN d.discord_id = $discord_id THEN 1 ELSE 0 END), "
+            "head(collect(d.discord_name))",
             {"name": legacy_name, "discord_id": discord_id},
         ).result_set[0]
         authored = self.graph.query(
@@ -100,8 +107,35 @@ class FalkorDbIntegrationTests(unittest.TestCase):
             "(:DiscordMessage {id: $message_id}) RETURN count(d)",
             {"discord_id": discord_id, "message_id": message_id},
         ).result_set[0][0]
-        self.assertEqual(result, [1, 1])
+        self.assertEqual(result, [1, 1, "Discord Name After"])
         self.assertEqual(authored, 1)
+
+    def test_name_collision_does_not_implicitly_claim_a_legacy_developer(self) -> None:
+        legacy_name = f"Collision Name {self.suffix}"
+        discord_id = str(600_000_000_000_000_000 + uuid.uuid4().int % 300_000_000_000_000_000)
+        self.graph.query(
+            "MERGE (d:Developer {name: $name}) REMOVE d.discord_id",
+            {"name": legacy_name},
+        )
+        with patch.dict(os.environ, {"DISCORD_DEVELOPER_MAP": "{}"}):
+            import_messages(self.graph, [DiscordMessage(
+                id=f"unmapped-author-{self.suffix}", channel_id=self.channel_id,
+                author_id=discord_id, author_name=legacy_name,
+                content="Ordinary update.",
+            )])
+
+        legacy = self.graph.query(
+            "MATCH (d:Developer {name: $name}) RETURN count(d), "
+            "sum(CASE WHEN d.discord_id IS NULL THEN 1 ELSE 0 END)",
+            {"name": legacy_name},
+        ).result_set[0]
+        self.assertEqual(legacy, [2, 1])
+        discord_author = self.graph.query(
+            "MATCH (d:Developer {discord_id: $discord_id}) "
+            "RETURN d.name, d.discord_name",
+            {"discord_id": discord_id},
+        ).result_set[0]
+        self.assertEqual(discord_author, [legacy_name, legacy_name])
 
     def test_authenticated_sync_and_task_retrieval_through_http_with_real_graph(self) -> None:
         channel_id = str(100_000_000_000_000_000 + uuid.uuid4().int % 800_000_000_000_000_000)

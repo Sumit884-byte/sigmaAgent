@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from graph_store import BATCH_SIZE, import_messages, retrieve_evidence
 from models import DiscordMessage
@@ -44,10 +45,12 @@ class ImporterTests(unittest.TestCase):
 
         self.assertEqual(counts, {"messages": 2, "evidence": 2, "task_links": 1})
         writes = [(query, params) for query, params in graph.queries if "UNWIND $items AS item" in query]
-        self.assertEqual(len(writes), 5)
-        self.assertTrue(any("FOREACH" in query and "item.unambiguous" in query for query, _ in writes))
+        self.assertEqual(len(writes), 4)
         self.assertTrue(any("MERGE (a:Developer {discord_id: item.author_id})" in query
                             for query, _ in writes))
+        author_query = next(query for query, _ in writes if "MERGE (a:Developer" in query)
+        self.assertIn("ON CREATE SET a.name = item.author_name", author_query)
+        self.assertIn("SET a.discord_name = item.author_name", author_query)
 
     def test_reimport_is_safe_to_repeat_via_stable_merge_keys(self) -> None:
         graph = RecordingGraph()
@@ -131,7 +134,26 @@ class ImporterTests(unittest.TestCase):
         write_queries = [query for query, _ in graph.queries if "UNWIND $items AS item" in query]
         self.assertTrue(any("MERGE (a:Developer {discord_id: item.author_id})" in query
                             for query in write_queries))
-        self.assertTrue(any("item.unambiguous" in query for query in write_queries))
+
+    def test_existing_developer_link_requires_explicit_discord_id_mapping(self) -> None:
+        graph = RecordingGraph()
+        message = DiscordMessage(
+            id="mapped-author", channel_id="c1", author_id="123456789012345678",
+            author_name="Discord Display Name",
+        )
+        with patch.dict("os.environ", {
+            "DISCORD_DEVELOPER_MAP": '{"123456789012345678":"Person Two"}',
+        }):
+            import_messages(graph, [message])
+
+        mapping_query = next(
+            query for query, _ in graph.queries if "developer_name" in query
+        )
+        mapping_params = next(
+            params for query, params in graph.queries if query == mapping_query
+        )
+        self.assertIn("OPTIONAL MATCH (developer:Developer {name: item.developer_name})", mapping_query)
+        self.assertEqual(mapping_params["items"][0]["developer_name"], "Person Two")
 
     def test_reimport_prunes_evidence_from_edited_message(self) -> None:
         graph = RecordingGraph()

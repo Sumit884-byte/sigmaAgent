@@ -24,10 +24,17 @@ the same message repeatedly is idempotent. Re-importing an edited message also
 removes evidence no longer supported by its current content. History writes are
 grouped into batches of 250 messages to limit query overhead and memory use.
 Range indexes support channel watermarks and full-text search supports message retrieval.
-Discord authors use their Discord user ID as the stable identity. A legacy
-Person 2 `Developer {name}` record is adopted when that name uniquely identifies
-one developer and one Discord user in the import; ambiguous names remain
-separate rather than merging people incorrectly.
+Discord authors use their Discord user ID as the stable identity, and their
+current display name is stored in `discord_name`. The canonical `Developer.name`
+is set only when a Discord author node is first created; later Discord renames
+do not overwrite a Person 2 developer's name. To link an author to an existing
+Person 2 developer, set `DISCORD_DEVELOPER_MAP` to an explicit JSON object that
+maps Discord user IDs to exact developer names, for example
+`{"456789012345678901":"Srushti"}`. Name-only automatic matching is disabled
+because names can collide. A mapping resolves only when exactly one Developer
+has the configured name; otherwise the importer leaves the existing records
+unmodified and creates a separate Discord author node. `Developer.name` is
+indexed for these configured lookups.
 The importer does not create or modify Person 2's `BLOCKED_BY` or `ASSIGNED_TO`
 relationships.
 
@@ -44,6 +51,7 @@ $env:FALKORDB_PORT = "6379"
 $env:FALKORDB_GRAPH = "SigmaPerson3Test"
 $env:CONTEXT_API_KEY = "<long-random-service-key>"
 $env:DISCORD_ALLOWED_CHANNEL_IDS = "234567890123456789"
+$env:DISCORD_DEVELOPER_MAP = '{"456789012345678901":"Srushti"}' # optional explicit identity mapping
 python import_history.py                 # imports mock_discord_history.json
 python -m uvicorn api:app --host 127.0.0.1 --port 8001
 ```

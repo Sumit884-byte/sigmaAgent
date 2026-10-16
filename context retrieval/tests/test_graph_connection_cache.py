@@ -39,6 +39,10 @@ class GraphConnectionCacheTests(unittest.TestCase):
         self.assertIs(first, second)
         driver.assert_called_once()
         self.assertEqual(graph.queries.count("CALL db.indexes()"), 1)
+        self.assertTrue(any(
+            "CREATE INDEX FOR (n:Developer) ON (n.name)" in query
+            for query in graph.queries
+        ))
         graph_store._GRAPH_CACHE.clear()
 
 

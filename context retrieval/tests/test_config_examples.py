@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from graph_store import _discord_developer_map
 
 
 class ExampleConfigurationTests(unittest.TestCase):
@@ -19,6 +22,24 @@ class ExampleConfigurationTests(unittest.TestCase):
         self.assertTrue(mock_messages)
         self.assertIn(mock_messages[0]["channel_id"], allowed_ids)
         self.assertNotIn(mock_messages[0]["guild_id"], allowed_ids)
+
+    def test_explicit_discord_developer_map_parses_id_to_canonical_name(self) -> None:
+        with patch.dict("os.environ", {
+            "DISCORD_DEVELOPER_MAP": '{"123456789012345678":"Person Two"}',
+        }):
+            self.assertEqual(
+                _discord_developer_map(), {"123456789012345678": "Person Two"}
+            )
+
+    def test_explicit_map_rejects_duplicate_developer_names(self) -> None:
+        with patch.dict("os.environ", {
+            "DISCORD_DEVELOPER_MAP": (
+                '{"123456789012345678":"Person Two",'
+                '"123456789012345679":"Person Two"}'
+            ),
+        }):
+            with self.assertRaisesRegex(ValueError, "at most one Discord user"):
+                _discord_developer_map()
 
 
 if __name__ == "__main__":

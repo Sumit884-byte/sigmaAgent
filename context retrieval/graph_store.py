@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import threading
-from collections import Counter
 from typing import Any, Iterable
 
 from falkordb import FalkorDB
@@ -17,7 +17,7 @@ BATCH_SIZE = 250
 RANGE_INDEXES = {
     "DiscordChannel": ("id",),
     "DiscordMessage": ("id", "channel_id", "timestamp"),
-    "Developer": ("discord_id",),
+    "Developer": ("discord_id", "name"),
     "ContextEvidence": ("id",),
     "Task": ("id",),
     "DiscordSyncState": ("channel_id",),
@@ -92,11 +92,33 @@ def _chunks(items: list[Any], size: int = BATCH_SIZE) -> Iterable[list[Any]]:
         yield items[start:start + size]
 
 
+def _discord_developer_map() -> dict[str, str]:
+    """Load explicit Discord user ID -> existing Person 2 developer name links."""
+    raw = os.getenv("DISCORD_DEVELOPER_MAP", "{}").strip() or "{}"
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("DISCORD_DEVELOPER_MAP must be a JSON object") from exc
+    if not isinstance(value, dict):
+        raise ValueError("DISCORD_DEVELOPER_MAP must be a JSON object")
+    mapping: dict[str, str] = {}
+    for discord_id, developer_name in value.items():
+        if not isinstance(discord_id, str) or not re.fullmatch(r"[0-9]{17,20}", discord_id):
+            raise ValueError("DISCORD_DEVELOPER_MAP keys must be Discord user IDs")
+        if not isinstance(developer_name, str) or not developer_name.strip():
+            raise ValueError("DISCORD_DEVELOPER_MAP values must be Developer names")
+        mapping[discord_id] = developer_name.strip()
+    if len(set(mapping.values())) != len(mapping):
+        raise ValueError("DISCORD_DEVELOPER_MAP must map at most one Discord user to each Developer name")
+    return mapping
+
+
 def import_messages(graph: Any, messages: list[DiscordMessage]) -> dict[str, int]:
     """Idempotently import messages and evidence using bounded bulk queries."""
     if not messages:
         return {"messages": 0, "evidence": 0, "task_links": 0}
     tasks = task_catalog(graph)
+    developer_map = _discord_developer_map()
     base_items = [
         {
             "channel_id": m.channel_id, "channel_name": m.channel_name,
@@ -111,34 +133,22 @@ def import_messages(graph: Any, messages: list[DiscordMessage]) -> dict[str, int
         item["author_id"]: {
             "author_id": item["author_id"],
             "author_name": item["author_name"],
+            "developer_name": developer_map.get(item["author_id"]),
         }
         for item in base_items
     }
-    author_name_counts = Counter(item["author_name"] for item in author_items_by_id.values())
-    author_items = [
-        {
-            **item,
-            # Reuse a legacy name-only Developer only when the name identifies
-            # one Discord user in this import batch.
-            "unambiguous": author_name_counts[item["author_name"]] == 1,
-        }
-        for item in author_items_by_id.values()
-    ]
-    legacy_author_query = """
+    mapped_author_items = [item for item in author_items_by_id.values() if item["developer_name"]]
+    mapped_author_query = """
     UNWIND $items AS item
-    OPTIONAL MATCH (identified:Developer {discord_id: item.author_id})
-    WITH item, count(identified) AS exact_matches
-    OPTIONAL MATCH (legacy:Developer {name: item.author_name})
-    WHERE exact_matches = 0
-      AND (legacy.discord_id IS NULL OR legacy.discord_id = item.author_id)
-    WITH item, exact_matches, collect(legacy) AS candidates
-    FOREACH (legacy IN CASE
-        WHEN exact_matches = 0 AND item.unambiguous AND size(candidates) = 1
-        THEN candidates ELSE [] END |
-        SET legacy.discord_id = item.author_id)
+    OPTIONAL MATCH (developer:Developer {name: item.developer_name})
+    WHERE developer.discord_id IS NULL OR developer.discord_id = item.author_id
+    WITH item, collect(developer) AS candidates
+    FOREACH (developer IN CASE WHEN size(candidates) = 1 THEN candidates ELSE [] END |
+        SET developer.discord_id = item.author_id,
+            developer.discord_name = item.author_name)
     """
-    for batch in _chunks(author_items):
-        graph.query(legacy_author_query, {"items": batch})
+    for batch in _chunks(mapped_author_items):
+        graph.query(mapped_author_query, {"items": batch})
     base_query = """
     UNWIND $items AS item
     MERGE (c:DiscordChannel {id: item.channel_id})
@@ -154,7 +164,8 @@ def import_messages(graph: Any, messages: list[DiscordMessage]) -> dict[str, int
     UNWIND $items AS item
     MATCH (m:DiscordMessage {id: item.message_id})
     MERGE (a:Developer {discord_id: item.author_id})
-    SET a.name = item.author_name
+    ON CREATE SET a.name = item.author_name
+    SET a.discord_name = item.author_name
     MERGE (a)-[:AUTHORED]->(m)
     """
     for batch in _chunks(base_items):
