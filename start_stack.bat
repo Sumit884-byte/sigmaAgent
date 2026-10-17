@@ -7,9 +7,12 @@ rem Run this from the sigmaAgent folder (double-click works too).
 
 cd /d "%~dp0"
 
-start "SigmaAgent API (8000)" cmd /k C:\Python312\python.exe -u -m uvicorn api:app --host 127.0.0.1 --port 8000
+set "PYTHON_EXE=python"
+if exist "C:\Python312\python.exe" set "PYTHON_EXE=C:\Python312\python.exe"
 
-start "SigmaAgent Context API (8001)" cmd /k C:\Python312\python.exe -u -m uvicorn api:app --host 127.0.0.1 --port 8001 --app-dir "context retrieval"
+start "SigmaAgent API (8000)" cmd /k %PYTHON_EXE% -u -m uvicorn api:app --host 127.0.0.1 --port 8000
+
+start "SigmaAgent Context API (8001)" cmd /k %PYTHON_EXE% -u -m uvicorn api:app --host 127.0.0.1 --port 8001 --app-dir "context retrieval"
 
 start "SigmaAgent Discord Bot" /D "%~dp0discord-bot" cmd /k .venv\Scripts\python.exe bot.py
 

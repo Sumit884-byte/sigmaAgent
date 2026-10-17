@@ -18,5 +18,6 @@ GEMINI.md
 .aider*
 .github/copilot-instructions.md
 
-# Screenshots and binary artifacts
-*.png
+# Local screenshots and credential images
+context retrieval/*.png
+token.png

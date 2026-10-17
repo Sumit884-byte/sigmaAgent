@@ -21,38 +21,71 @@ import httpx
 GITHUB_API = "https://api.github.com"
 DEFAULT_REPO = os.getenv("GITHUB_REPO", "Sumit884-byte/sigmaAgent")
 CACHE_TTL_SECONDS = 120
-REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+SAFE_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9_])?$")
+REPO_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$")
+
+COMMON_NON_REPOS = {
+    "frontend/backend", "backend/frontend", "client/server", "server/client",
+    "ci/cd", "cd/ci", "input/output", "read/write", "and/or", "true/false",
+    "before/after", "left/right", "top/bottom", "up/down", "yes/no",
+}
+
+
+def is_safe_repo(repo: str) -> bool:
+    """Validate that owner/name is well-formed, exists as a repo reference, and avoids traversal like '..'."""
+    if not repo or "/" not in repo:
+        return False
+    parts = repo.split("/", 1)
+    if len(parts) != 2:
+        return False
+    owner, name = parts[0].strip(), parts[1].strip()
+    if not owner or not name:
+        return False
+    # Strictly reject path traversal or hidden dot-files
+    if ".." in owner or ".." in name:
+        return False
+    if owner.startswith(".") or name.startswith("."):
+        return False
+    if f"{owner.lower()}/{name.lower()}" in COMMON_NON_REPOS:
+        return False
+    return bool(SAFE_OWNER_RE.fullmatch(owner) and SAFE_NAME_RE.fullmatch(name))
+
+
 ISSUE_NUMBER = re.compile(r"\bissue\s*#?(\d{1,7})\b", re.IGNORECASE)
 # github.com/owner/repo inside a pasted URL; extra path segments are ignored
-GITHUB_URL_REPO = re.compile(r"github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", re.IGNORECASE)
+GITHUB_URL_REPO = re.compile(
+    r"github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_][A-Za-z0-9_.-]{0,99})",
+    re.IGNORECASE,
+)
 # github.com/owner/repo/issues/42 or /pull/42 in a pasted URL
 URL_ISSUE_NUMBER = re.compile(
     r"github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pull)/(\d{1,7})", re.IGNORECASE
 )
-# Bare owner/name ("barchart/marketdata-api-js") — both parts must start with a
-# letter so dates (24/7) and fractions don't look like repositories
-BARE_REPO = re.compile(
-    r"(?<![\w./@])([A-Za-z][A-Za-z0-9_.-]{0,58})/([A-Za-z][A-Za-z0-9_.-]{0,98})(?![\w-])"
-)
 ASSIGNEE_RE = re.compile(r"\bassigned to @?([A-Za-z0-9][A-Za-z0-9-]{0,38})\b", re.IGNORECASE)
 AUTHOR_RE = re.compile(r"\b(?:opened|created|filed|wrote|written) by @?([A-Za-z0-9][A-Za-z0-9-]{0,38})\b",
                        re.IGNORECASE)
-QUOTED_LABEL_RE = re.compile(r"[\"']([A-Za-z0-9 .+/_-]{2,40})[\"']")
-# Bare issue-filter words friends use; quoted labels are extracted as-is
-LABEL_KEYWORDS = {
-    "good first issue": ["good first issue", "good first issues", "beginner friendly"],
-    "help wanted": ["help wanted"],
-    "bug": ["bug", "bugs"],
-    "enhancement": ["enhancement", "feature", "feature request"],
-    "documentation": ["documentation", "docs"],
+# Only accept double quotes or backticks to avoid apostrophes ('s) becoming fake label filters
+QUOTED_LABEL_RE = re.compile(r'["`]([A-Za-z0-9 .+/_-]{2,40})["`]')
+# Match whole words with \b to avoid "debug" -> "bug", "docstring" -> "docs", "featured" -> "feature"
+LABEL_PATTERNS = {
+    "good first issue": [
+        re.compile(r"\bgood\s+first\s+issues?\b", re.IGNORECASE),
+        re.compile(r"\bbeginner\s+friendly\b", re.IGNORECASE),
+    ],
+    "help wanted": [re.compile(r"\bhelp\s+wanted\b", re.IGNORECASE)],
+    "bug": [re.compile(r"\bbugs?\b", re.IGNORECASE)],
+    "enhancement": [
+        re.compile(r"\benhancements?\b", re.IGNORECASE),
+        re.compile(r"\bfeature\s+requests?\b", re.IGNORECASE),
+        re.compile(r"\bfeatures?\b", re.IGNORECASE),
+    ],
+    "documentation": [
+        re.compile(r"\bdocumentation\b", re.IGNORECASE),
+        re.compile(r"\bdocs?\b", re.IGNORECASE),
+    ],
 }
-# Substring stems so one entry covers commits/committed/committers, issue/issues, comparisons, etc.
-HINT_STEMS = (
-    "github", "repo", "repositor", "commit", "contribut", "issue", "bug",
-    "compare", "compet", "showdown", "versus", "leaderboard", "unassigned",
-)
-
-# Short-lived cache: repeated mentions shouldn't burn the GitHub rate limit.
+MAX_CACHE_ENTRIES = 200
 _CACHE: dict[str, tuple[float, Any]] = {}
 
 
@@ -98,22 +131,42 @@ def gh_get(path: str, params: dict[str, str] | None = None) -> Any:
     cached = _CACHE.get(key)
     if cached and now - cached[0] < CACHE_TTL_SECONDS:
         return cached[1]
+
+    # Clean up expired entries if cache is growing
+    if len(_CACHE) >= MAX_CACHE_ENTRIES:
+        expired = [k for k, (ts, _) in _CACHE.items() if now - ts >= CACHE_TTL_SECONDS]
+        for k in expired:
+            _CACHE.pop(k, None)
+        if len(_CACHE) >= MAX_CACHE_ENTRIES:
+            oldest = sorted(_CACHE.keys(), key=lambda k: _CACHE[k][0])[:MAX_CACHE_ENTRIES // 5]
+            for k in oldest:
+                _CACHE.pop(k, None)
+
     value = _http_get_json(path, params)
     _CACHE[key] = (now, value)
     return value
 
 
 def extract_repo(question: str) -> str | None:
-    """The repository named in the question: a github.com URL or a bare owner/name."""
+    """The repository named in the question: a github.com URL or an explicit repo reference."""
     match = GITHUB_URL_REPO.search(question or "")
     if match:
-        owner, name = match.group(1), match.group(2)
-    else:
-        match = BARE_REPO.search(question or "")
-        if not match:
-            return None
-        owner, name = match.group(1), match.group(2)
-    return f"{owner}/{name.rstrip('.,;:!?)]}')}"
+        candidate = f"{match.group(1)}/{match.group(2).rstrip('.,;:!?)]}')}"
+        if is_safe_repo(candidate):
+            return candidate
+
+    # Look for explicit repo: owner/repo, repository owner/repo, in/for/to owner/repo
+    explicit_match = re.search(
+        r"(?:repo|repository|in|for|to)\s*[:=]?\s*([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_][A-Za-z0-9_.-]{0,99})\b",
+        question or "",
+        re.IGNORECASE,
+    )
+    if explicit_match:
+        candidate = f"{explicit_match.group(1)}/{explicit_match.group(2).rstrip('.,;:!?)]}')}"
+        if is_safe_repo(candidate):
+            return candidate
+
+    return None
 
 
 def _issue_number(question: str) -> int | None:
@@ -123,8 +176,10 @@ def _issue_number(question: str) -> int | None:
 
 
 def _repo_path(repo: str, suffix: str = "") -> str:
-    if not REPO_PATTERN.fullmatch(repo or ""):
+    if not is_safe_repo(repo):
         raise GitHubNotFound(f"invalid repository reference {repo!r} (expected owner/name)")
+    if ".." in suffix:
+        raise GitHubNotFound(f"invalid path suffix {suffix!r}")
     return f"/repos/{repo}{suffix}"
 
 
@@ -155,15 +210,22 @@ def get_issues(repo: str = DEFAULT_REPO, state: str = "open",
                labels: list[str] | None = None,
                author: str | None = None, assignee: str | None = None,
                unassigned: bool = False) -> list[dict[str, Any]]:
-    """Issues (pull requests filtered out), newest activity first, filtered client-side.
+    """Issues (pull requests filtered out), newest activity first.
 
-    Fetches up to the 100 most recently updated issues; answers say so when the
-    window matters (leaderboards), so they never claim exact totals for huge repos.
+    Fetches up to 100 issues matching server-side filters; answers note that it is
+    a recent window.
     """
     if state not in {"open", "closed", "all"}:
         state = "open"
-    items = gh_get(_repo_path(repo, "/issues"),
-                   {"state": state, "per_page": "100", "sort": "updated", "direction": "desc"})
+    params: dict[str, str] = {"state": state, "per_page": "100", "sort": "updated", "direction": "desc"}
+    if labels:
+        params["labels"] = ",".join(labels)
+    if author:
+        params["creator"] = author.lstrip("@")
+    if assignee:
+        params["assignee"] = assignee.lstrip("@")
+
+    items = gh_get(_repo_path(repo, "/issues"), params)
     wanted = {label.casefold() for label in labels} if labels else None
     author_id = (author or "").casefold().lstrip("@")
     assignee_id = (assignee or "").casefold().lstrip("@")
@@ -207,9 +269,20 @@ def get_issue(repo: str, number: int) -> dict[str, Any]:
     issue = gh_get(_repo_path(repo, f"/issues/{int(number)}"))
     if not isinstance(issue, dict):
         raise GitHubNotFound(f"issue {number}")
-    comments = gh_get(_repo_path(repo, f"/issues/{number}/comments"), {"per_page": "10"})
-    if not isinstance(comments, list):
-        comments = []
+    comments_count = int(issue.get("comments") or 0)
+    comments = []
+    if comments_count > 0:
+        # GitHub issue comments are ordered chronologically (page 1 has oldest).
+        # Fetch the last page (up to 10 comments) to get the latest discussion.
+        page = max(1, (comments_count + 9) // 10)
+        comments_data = gh_get(_repo_path(repo, f"/issues/{number}/comments"), {"per_page": "10", "page": str(page)})
+        if isinstance(comments_data, list) and comments_data:
+            comments = comments_data
+        elif page > 1:
+            fallback = gh_get(_repo_path(repo, f"/issues/{number}/comments"), {"per_page": "10"})
+            if isinstance(fallback, list):
+                comments = fallback
+
     return {
         "number": issue.get("number") or int(number),
         "title": issue.get("title") or "",
@@ -219,7 +292,7 @@ def get_issue(repo: str, number: int) -> dict[str, Any]:
         "created_at": issue.get("created_at"),
         "updated_at": issue.get("updated_at"),
         "labels": _issue_labels(issue),
-        "comments_count": int(issue.get("comments") or 0),
+        "comments_count": comments_count,
         "body": issue.get("body") or "",
         "url": issue.get("html_url") or "",
         "comments": [
@@ -252,12 +325,16 @@ def _repo_url(repo: str) -> str:
 
 def format_contributors(repo: str, contributors: list[dict[str, Any]]) -> str:
     total = sum(contributor["commits"] for contributor in contributors)
-    lines = [f"**{repo}** has **{total}** commits by **{len(contributors)}** contributor(s):"]
+    count = len(contributors)
+    if count >= 100:
+        lines = [f"**{repo}** top **{count}** contributors have recorded at least **{total:,}** commits:"]
+    else:
+        lines = [f"**{repo}** has **{total:,}** commits by **{count}** contributor(s):"]
     for contributor in contributors[:10]:
         share = f" ({round(contributor['commits'] * 100 / total)}%)" if total else ""
-        lines.append(f"- **{contributor['login']}** — {contributor['commits']} commits{share}")
-    if len(contributors) > 10:
-        lines.append(f"...and {len(contributors) - 10} more ([all contributors]({_repo_url(repo)}/graphs/contributors))")
+        lines.append(f"- **{contributor['login']}** — {contributor['commits']:,} commits{share}")
+    if count > 10:
+        lines.append(f"...and {count - 10} more in this top {count} list ([all contributors]({_repo_url(repo)}/graphs/contributors))")
     else:
         lines.append(f"[Repository]({_repo_url(repo)})")
     return "\n".join(lines)
@@ -266,7 +343,8 @@ def format_contributors(repo: str, contributors: list[dict[str, Any]]) -> str:
 def format_issues(repo: str, issues: list[dict[str, Any]], *, kind: str) -> str:
     if not issues:
         return f"There are no {kind} in **{repo}** right now."
-    lines = [f"**{kind.capitalize()} in {repo}** ({len(issues)}):"]
+    total_found = len(issues)
+    lines = [f"**{kind.capitalize()} in {repo}** ({total_found} recent):"]
     for issue in issues[:10]:
         labels = f" [{', '.join(issue['labels'])}]" if issue["labels"] else ""
         lines.append(
@@ -274,8 +352,8 @@ def format_issues(repo: str, issues: list[dict[str, Any]], *, kind: str) -> str:
             f"on {_month_day(issue['created_at'])}, {issue['comments']} comments "
             f"([view]({issue['url']}))"
         )
-    if len(issues) > 10:
-        lines.append(f"...and {len(issues) - 10} more ([all {kind}]({_repo_url(repo)}/issues))")
+    if total_found > 10:
+        lines.append(f"...and {total_found - 10} more in this recent window ([all {kind}]({_repo_url(repo)}/issues))")
     return "\n".join(lines)
 
 
@@ -314,15 +392,14 @@ GITHUB_HELP_TEXT = (
 
 
 def extract_labels(question: str) -> list[str]:
-    """Labels to filter by: quoted phrases (`labeled "good first issue"`) or bare keywords."""
+    """Labels to filter by: double-quoted/backticked phrases (`labeled "good first issue"`) or bare keywords."""
     labels: list[str] = []
     for name in QUOTED_LABEL_RE.findall(question or ""):
         name = name.strip()
         if name.casefold() not in {label.casefold() for label in labels}:
             labels.append(name)
-    lowered = (question or "").casefold()
-    for canonical, keywords in LABEL_KEYWORDS.items():
-        if any(keyword in lowered for keyword in keywords):
+    for canonical, patterns in LABEL_PATTERNS.items():
+        if any(pattern.search(question or "") for pattern in patterns):
             if canonical.casefold() not in {label.casefold() for label in labels}:
                 labels.append(canonical)
     return labels
@@ -379,6 +456,7 @@ COMPARE_STOP_WORDS = {
     "open", "closed", "all", "me", "who", "what", "which", "how", "for", "in", "on", "at",
     "with", "between", "and", "vs", "versus", "compare", "competition", "showdown", "track",
     "project", "friends", "collaboration", "competing", "winning", "leaderboard", "rank",
+    "progress", "status", "task", "tasks", "feature", "features", "work", "update", "updates",
 }
 
 
@@ -388,13 +466,22 @@ def extract_compare_users(text: str) -> list[str]:
     if not re.search(r"\b(?:compare|competition|compete|competing|showdown|versus|vs\.?|winning|between|track)\b", lower):
         return []
 
+    def _valid_username(u: str) -> bool:
+        u_clean = u.lstrip("@").strip()
+        if not u_clean or u_clean.casefold() in COMPARE_STOP_WORDS:
+            return False
+        # Task IDs like T1, T2, T3 are NOT usernames
+        if re.fullmatch(r"T\d+", u_clean, re.IGNORECASE):
+            return False
+        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,38}", u_clean))
+
     # Check for "between X and Y (and Z)"
     m = re.search(
         r"\bbetween\s+@?([A-Za-z0-9_-]+)\s+(?:and|vs\.?)\s+@?([A-Za-z0-9_-]+)(?:\s+(?:and|vs\.?)\s+@?([A-Za-z0-9_-]+))?",
         text, re.IGNORECASE,
     )
     if m:
-        users = [u for u in m.groups() if u and u.casefold() not in COMPARE_STOP_WORDS]
+        users = [u for u in m.groups() if u and _valid_username(u)]
         if len(users) >= 2:
             return users
 
@@ -404,20 +491,20 @@ def extract_compare_users(text: str) -> list[str]:
         text, re.IGNORECASE,
     )
     if m:
-        users = [u for u in m.groups() if u and u.casefold() not in COMPARE_STOP_WORDS]
+        users = [u for u in m.groups() if u and _valid_username(u)]
         if len(users) >= 2:
             return users
 
     # Check for "X vs Y"
     m = re.search(r"\b@?([A-Za-z0-9_-]+)\s+vs\.?\s+@?([A-Za-z0-9_-]+)\b", text, re.IGNORECASE)
     if m:
-        users = [u for u in m.groups() if u and u.casefold() not in COMPARE_STOP_WORDS]
+        users = [u for u in m.groups() if u and _valid_username(u)]
         if len(users) >= 2:
             return users
 
     # Check for @mentions in a comparison context
     mentions = re.findall(r"@([A-Za-z0-9_-]+)", text)
-    valid_mentions = [m for m in mentions if m.casefold() not in COMPARE_STOP_WORDS]
+    valid_mentions = [m for m in mentions if _valid_username(m)]
     if len(valid_mentions) >= 2:
         return valid_mentions
 
@@ -491,10 +578,19 @@ def format_friend_competition(
     lines = [f"**Open-Source Showdown in {repo}** ({len(user_logins)} friends tracked):"]
     sorted_users = sorted(stats.values(), key=lambda s: (-s["score"], -s["commits"], -s["total_assigned"]))
     for s in sorted_users:
-        rank_str = f" (#{s['rank']} overall)" if s["rank"] else " (no commits recorded)"
+        if s["rank"]:
+            if len(contributors) >= 100:
+                rank_str = f" (#{s['rank']} in top {len(contributors)})"
+            else:
+                rank_str = f" (#{s['rank']} overall)"
+        else:
+            if len(contributors) >= 100:
+                rank_str = f" (outside top {len(contributors)})"
+            else:
+                rank_str = ""
         lines.append(
             f"- **{s['login']}** (score: {s['score']}):\n"
-            f"  - Commits: **{s['commits']}**{rank_str}\n"
+            f"  - Commits: **{s['commits']:,}**{rank_str}\n"
             f"  - Assigned Issues: **{s['total_assigned']}** ({s['assigned_closed']} completed, {s['assigned_open']} in progress)\n"
             f"  - Issues Opened: **{s['total_opened']}** ({s['opened_closed']} closed, {s['opened_open']} open)\n"
             f"  - Profile: https://github.com/{s['login']}"
@@ -504,7 +600,7 @@ def format_friend_competition(
     if len(sorted_users) > 1 and top["score"] > sorted_users[1]["score"]:
         lines.append(
             f"\n**Leader**: **{top['login']}** leads the competition with **{top['score']}** points "
-            f"({top['commits']} commits, {top['total_assigned']} assigned issues)!"
+            f"({top['commits']:,} commits, {top['total_assigned']} assigned issues)!"
         )
     elif len(sorted_users) > 1 and top["score"] == sorted_users[1]["score"] and top["score"] > 0:
         lines.append(f"\n**Tie**: It's a tie between **{top['login']}** and **{sorted_users[1]['login']}** with **{top['score']}** points!")
@@ -516,17 +612,63 @@ def format_friend_competition(
     return "\n".join(lines)
 
 
+TASK_COMMAND_PATTERN = re.compile(
+    r"^\s*(?:create\s+task|add\s+task|new\s+task|assign\b|unassign\b|rename\s+task|delete\s+task|set\s+status|explain\b|mark\s+task)\b|"
+    r"\bas\s+a\s+(?:new\s+)?task\b|"
+    r"\bfor\s+a\s+(?:new\s+)?task\b|"
+    r"\bT\d+\s+(?:is\s+blocked\s+by|is\s+unblocked|depends\s+on|now\s+depends|no\s+longer\s+depends|is\s+done|is\s+in\s+progress|is\s+assigned)\b|"
+    r"\b(?:blocked\s+by|depends\s+on|waiting\s+on)\s+T\d+\b|"
+    r"\bwho\s+should\s+own\b",
+    re.IGNORECASE,
+)
+EXPLICIT_GITHUB_TRIGGER = re.compile(
+    r"(?:https?://github\.com/\S+|\bgithub\b|\bgh\b|\b(?:in|on|for|from)\s+github\b|\brepo:\s*[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+|\b(?:in|for|to)\s+repo\s+[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+)",
+    re.IGNORECASE,
+)
+GITHUB_QUERY_INTENT = re.compile(
+    r"\b(?:who\s+are\s+the\s+contributors|who\s+committed|who\s+contributed|how\s+many\s+(?:of\s+the\s+people\s+have\s+)?committ?ed|contributor\s+list)\b|"
+    r"\b(?:what|show|list|find|get)\s+(?:are\s+the\s+)?(?:all\s+)?(?:open\s+|closed\s+|unassigned\s+)?(?:issues|bugs|tickets)\b|"
+    r"\b(?:what\s+bugs\s+are\s+open|open\s+bugs\b|closed\s+issues\b|unassigned\s+issues\b|unclaimed\s+issues\b)"
+    r"|\b(?:issues|bugs)\s+labeled\b"
+    r"|\bissues\s+assigned\s+to\b"
+    r"|\bissues\s+(?:were\s+)?opened\s+by\b"
+    r"|\bwho\s+opened\s+the\s+most\s+issues\b"
+    r"|\bwho\s+has\s+the\s+most\s+assigned\s+issues\b"
+    r"|\b(?:summarize|summary|details\s+of)\s+issue\b"
+    r"|\bissue\s+#\d+\b",
+    re.IGNORECASE,
+)
+
+
 def answer_github_question(question: str, repo: str | None = None) -> str | None:
     """Answer a repository question from live GitHub data, or None if it isn't one."""
-    lowered = (question or "").casefold()
-    if not any(stem in lowered for stem in HINT_STEMS):
+    if not question:
         return None
-    # A repository named in the question (URL or owner/name) wins over the configured default
-    repo = extract_repo(question) or repo or DEFAULT_REPO
+
+    # 1. Never claim task mutation commands or task statements
+    if TASK_COMMAND_PATTERN.search(question):
+        return None
+
+    extracted_repo = extract_repo(question)
+    has_explicit_trigger = bool(
+        extracted_repo
+        or EXPLICIT_GITHUB_TRIGGER.search(question)
+        or re.search(r"\b(?:to|in)\s+the\s+repo\b", question, re.IGNORECASE)
+    )
+
+    # 2. If repo was not explicitly passed in by the caller, require an explicit trigger or recognized GitHub intent
+    if repo is None and not has_explicit_trigger:
+        if not GITHUB_QUERY_INTENT.search(question):
+            return None
+
+    target_repo = extracted_repo or repo or DEFAULT_REPO
+    if not is_safe_repo(target_repo):
+        return None
+
     try:
         number = _issue_number(question)
         if number:
-            return format_issue_summary(repo, get_issue(repo, number))
+            return format_issue_summary(target_repo, get_issue(target_repo, number))
 
         # Separate question prose from URLs to prevent '/issues' in URLs from overriding intent
         prose = re.sub(r"https?://\S+", "", question or "").strip()
@@ -535,9 +677,11 @@ def answer_github_question(question: str, repo: str | None = None) -> str | None
         # Check for friend competition / multi-user comparison
         compare_users = extract_compare_users(prose or question)
         if len(compare_users) >= 2:
-            contributors = get_contributors(repo)
-            issues = get_issues(repo, state="all")
-            return format_friend_competition(repo, compare_users, contributors, issues)
+            if has_explicit_trigger or repo is not None:
+                contributors = get_contributors(target_repo)
+                issues = get_issues(target_repo, state="all")
+                return format_friend_competition(target_repo, compare_users, contributors, issues)
+            return None
 
         wants_commits = bool(
             re.search(
@@ -550,10 +694,8 @@ def answer_github_question(question: str, repo: str | None = None) -> str | None
         )
 
         # If user explicitly asks about commits/contributors in prose, prioritize commits!
-        # This directly resolves:
-        # "@sigmaagent https://github.com/vllm-project/vllm/issues for this repo. how many of the people have commited?"
         if wants_commits and not wants_issues_in_prose:
-            return format_contributors(repo, get_contributors(repo))
+            return format_contributors(target_repo, get_contributors(target_repo))
 
         url_is_issues = bool(re.search(r"github\.com/[^/]+/[^/]+/issues\b", question or "", re.IGNORECASE))
         wants_issues = wants_issues_in_prose or "leaderboard" in prose_lowered or (not prose and url_is_issues)
@@ -570,38 +712,53 @@ def answer_github_question(question: str, repo: str | None = None) -> str | None
                 re.search(r"\b(?:unassigned|unclaimed|available|no assignee|without assignee)\b", prose_lowered)
             )
 
-            state = "closed" if "closed" in prose_lowered else "all" if bool(re.search(r"\ball\b", prose_lowered)) else "open"
+            # "all the open bugs" -> state="open", not "all"
+            if re.search(r"\bclosed\b", prose_lowered):
+                state = "closed"
+            elif re.search(r"\ball\s+(?:the\s+)?open\b", prose_lowered):
+                state = "open"
+            elif re.search(r"\ball\b", prose_lowered):
+                state = "all"
+            else:
+                state = "open"
 
             if "summar" in prose_lowered and not (labels or author or assignee or unassigned):
-                issues = get_issues(repo, state=state)
+                issues = get_issues(target_repo, state=state)
                 if not issues:
-                    return f"There are no {state} issues in **{repo}** to summarize."
-                return format_issue_summary(repo, get_issue(repo, issues[0]["number"]))
+                    return f"There are no {state} issues in **{target_repo}** to summarize."
+                return format_issue_summary(target_repo, get_issue(target_repo, issues[0]["number"]))
 
-            wants_leaderboard = "leaderboard" in prose_lowered or (
-                "most" in prose_lowered and any(w in prose_lowered for w in ("issue", "bug", "work", "assigned"))
+            # Leaderboard requires explicit leaderboard / ranking intent
+            wants_leaderboard = "leaderboard" in prose_lowered or bool(
+                re.search(
+                    r"\b(?:who\s+opened\s+the\s+most|who\s+has\s+the\s+most|most\s+issues\s+by|top\s+issue\s+authors?|author\s+leaderboard|assignee\s+leaderboard|top\s+assignees?)\b",
+                    prose_lowered,
+                )
             )
             if wants_leaderboard:
                 lb_state = state if "closed" in prose_lowered or bool(re.search(r"\bopen\b", prose_lowered)) else "all"
                 issues = get_issues(
-                    repo, state=lb_state, labels=labels, author=author, assignee=assignee, unassigned=unassigned
+                    target_repo, state=lb_state, labels=labels, author=author, assignee=assignee, unassigned=unassigned
                 )
                 if not issues:
-                    return f"There are no matching issues in **{repo}** to rank yet."
+                    return f"There are no matching issues in **{target_repo}** to rank yet."
                 metric = "assignee" if any(w in prose_lowered for w in ("assignee", "assigned", "working", "work")) else "author"
-                return format_issue_leaderboard(repo, issues, metric=metric)
+                return format_issue_leaderboard(target_repo, issues, metric=metric)
 
             return format_issues(
-                repo,
-                get_issues(repo, state=state, labels=labels, author=author, assignee=assignee, unassigned=unassigned),
+                target_repo,
+                get_issues(target_repo, state=state, labels=labels, author=author, assignee=assignee, unassigned=unassigned),
                 kind=_issues_kind(state, labels, author, assignee, unassigned=unassigned),
             )
 
-        if wants_commits or "commit" in lowered or "contribut" in lowered:
-            return format_contributors(repo, get_contributors(repo))
+        if wants_commits or "commit" in prose_lowered or "contribut" in prose_lowered:
+            return format_contributors(target_repo, get_contributors(target_repo))
 
-        return GITHUB_HELP_TEXT.format(repo=repo)
+        if has_explicit_trigger:
+            return GITHUB_HELP_TEXT.format(repo=target_repo)
+
+        return None
     except GitHubNotFound:
-        return f"I couldn't find that on GitHub for **{repo}**. Check the repository or issue number."
+        return f"I couldn't find that on GitHub for **{target_repo}**. Check the repository or issue number."
     except GitHubUnavailable as exc:
         return f"I couldn't reach GitHub just now: {exc}. Nothing was changed; try again in a minute."

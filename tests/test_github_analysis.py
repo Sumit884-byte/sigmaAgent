@@ -49,14 +49,82 @@ class GitHubAnswerTests(unittest.TestCase):
         self.repo = "Sumit884-byte/sigmaAgent"
 
     def test_non_github_questions_are_not_intercepted(self):
+        """Task-bot messages must NEVER be claimed by answer_github_question."""
         for question in (
+            # original smoke-test cases
             "Why is T5 delayed?",
             "explain T5",
             "what is blocked?",
             "What is Person 4 working on?",
             "list tasks",
+            # Critical-1: exact messages from the PR review
+            "create task Fix login bug for Alice",
+            "T5 is blocked by T3, there's an issue with tokens",
+            "compare T3 and T4 progress",
+            "set up the repo structure as a new task for Bob",
+            "frontend/backend split: who should own which issue?",
         ):
-            self.assertIsNone(answer_github_question(question, self.repo), question)
+            with self.subTest(question=question):
+                self.assertIsNone(answer_github_question(question, self.repo), question)
+
+    def test_path_traversal_rejected(self):
+        """A literal '..' in a parsed github.com URL owner or repo name must be rejected and the
+        GitHub API must never receive a traversal path like /repos/../user/issues."""
+        # Direct traversal: the URL regex requires alphanumeric owner starts, so
+        # github.com/../user won't be extracted. But if somehow a '..'-containing string
+        # passes extract_repo, is_safe_repo must catch it.
+        from github_analysis import is_safe_repo
+        traversal_repos = [
+            "../user",
+            "owner/../etc",
+            "..%2F../etc/passwd",
+            ".hidden/repo",
+            "owner/.hidden",
+        ]
+        for repo in traversal_repos:
+            with self.subTest(repo=repo):
+                self.assertFalse(is_safe_repo(repo), f"should be rejected: {repo!r}")
+
+        # Verify answer_github_question passes the traversal repo through is_safe_repo and
+        # returns None without calling the API, when the caller explicitly passes a bad repo.
+        with patch.object(github_analysis, "_http_get_json") as fetch:
+            result = answer_github_question("who are the contributors?", repo="../user")
+        fetch.assert_not_called()
+        self.assertIsNone(result)
+
+    def test_apostrophe_not_treated_as_label_quote(self):
+        """Apostrophes like "bob's" must not be captured as a quoted label filter."""
+        with patch.object(github_analysis, "_http_get_json",
+                          return_value=[issue(1, "Login crash"), issue(2, "Docs update")]) as fetch:
+            answer = answer_github_question("what's the status of bob's open issues in github?", self.repo)
+        # The apostrophe must not be parsed as a label; both issues should appear
+        self.assertIsNotNone(answer)
+        self.assertIn("Login crash", answer)
+        self.assertIn("Docs update", answer)
+
+    def test_word_boundary_label_matching(self):
+        """'debugging' must not match the 'bug' label; 'docstring' must not match 'docs'."""
+        with patch.object(github_analysis, "_http_get_json",
+                          return_value=[issue(1, "Fix login crash"), issue(2, "Docs update")]):
+            answer = answer_github_question(
+                "list open issues about debugging and docstring handling on github", self.repo
+            )
+        self.assertIsNotNone(answer)
+        # Should show both issues (no label filter applied)
+        self.assertIn("Fix login crash", answer)
+        self.assertIn("Docs update", answer)
+        # Should NOT have applied a 'bug' label filter
+        self.assertNotIn("labeled `bug`", answer)
+
+    def test_no_explicit_trigger_without_github_intent_returns_none(self):
+        """Generic messages with no GitHub trigger word must return None when no repo is passed."""
+        for question in (
+            "how is the project going?",
+            "what did we decide about the auth module?",
+            "update me on the sprint",
+        ):
+            with self.subTest(question=question):
+                self.assertIsNone(answer_github_question(question), question)
 
     def test_contributors_and_commit_counts(self):
         with patch.object(github_analysis, "_http_get_json",
