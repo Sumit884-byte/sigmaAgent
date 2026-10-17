@@ -7,12 +7,14 @@ from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from falkordb import FalkorDB
 from google import genai
 from google.genai import errors as genai_errors
 from pydantic import BaseModel
 
+import continuous_sync
+from continuous_sync import BackgroundKnowledgeSyncer, handle_github_webhook, verify_github_signature
 import knowledge
 from github_analysis import (
     GitHubNotFound,
@@ -170,6 +172,81 @@ def knowledge_sync(req: KnowledgeSyncRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (GitHubNotFound, GitHubUnavailable) as exc:
         raise _github_http_error(exc) from exc
+
+
+def _default_graph_provider():
+    guild_id = os.getenv("DISCORD_GUILD_ID", "1")
+    try:
+        return tenant_graph(guild_id)
+    except Exception:
+        return None
+
+
+background_syncer = BackgroundKnowledgeSyncer(
+    graph_provider=_default_graph_provider,
+    default_repo=GITHUB_REPO,
+)
+
+
+@app.on_event("startup")
+def _start_background_syncer():
+    background_syncer.start()
+
+
+@app.on_event("shutdown")
+def _stop_background_syncer():
+    background_syncer.stop()
+
+
+@app.post("/webhooks/github")
+async def github_webhook(request: Request):
+    """Receive live GitHub webhooks (push, issues, pull_request) to keep the graph automatically current."""
+    event = request.headers.get("X-GitHub-Event")
+    if not event:
+        raise HTTPException(status_code=400, detail="Missing X-GitHub-Event header")
+
+    body_bytes = await request.body()
+    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+    signature = request.headers.get("X-Hub-Signature-256")
+    if not verify_github_signature(body_bytes, signature, secret):
+        raise HTTPException(status_code=401, detail="Invalid X-Hub-Signature-256 signature")
+
+    try:
+        payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Malformed JSON payload: {exc}") from exc
+
+    guild_id = (
+        request.headers.get("X-Discord-Guild-ID")
+        or request.query_params.get("guild_id")
+        or os.getenv("DISCORD_GUILD_ID", "1")
+    )
+    try:
+        graph = tenant_graph(guild_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid target graph: {exc}") from exc
+
+    try:
+        result = handle_github_webhook(graph, event, payload)
+        background_syncer.webhook_events_count += 1
+        return result
+    except GitHubNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/knowledge/sync/status")
+def knowledge_sync_status():
+    """Inspect background knowledge syncer health, stats, and webhook event counts."""
+    return background_syncer.get_status()
+
+
+@app.post("/knowledge/sync/run-now")
+async def knowledge_sync_run_now():
+    """Trigger an immediate background synchronization cycle across configured repositories."""
+    return await background_syncer.sync_now()
+
 
 
 class InvestigateRequest(BaseModel):
