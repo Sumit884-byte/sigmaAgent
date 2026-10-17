@@ -38,4 +38,8 @@ class ContextRequest(BaseModel):
     channel_id: str | None = Field(
         default=None, min_length=17, max_length=20, pattern=DISCORD_CHANNEL_ID_PATTERN
     )
+    # Selects the Discord server's own graph when per-server graphs are enabled
+    guild_id: str | None = Field(
+        default=None, min_length=17, max_length=20, pattern=DISCORD_CHANNEL_ID_PATTERN
+    )
     limit: int = Field(default=20, ge=1, le=100)
