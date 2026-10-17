@@ -131,16 +131,25 @@ def _dependency_report(guild_id):
                 upstream(dep_id, seen)
         return seen
 
+    longest_open_cache = {}
+
     def longest_open_chain(task_id, visiting=()):
         # Longest chain of unfinished work ending at this task (guards against cycles)
-        if task_id in visiting or tasks[task_id]["status"] == "done":
+        if task_id in visiting:
+            return []
+        if task_id in longest_open_cache:
+            return longest_open_cache[task_id]
+        if tasks[task_id]["status"] == "done":
+            longest_open_cache[task_id] = []
             return []
         best = []
         for dep_id in tasks[task_id]["deps"]:
             if dep_id in tasks:
                 chain = longest_open_chain(dep_id, visiting + (task_id,))
                 best = max(best, chain, key=len)
-        return best + [task_id]
+        result = best + [task_id]
+        longest_open_cache[task_id] = result
+        return result
 
     def label(task_id):
         task = tasks[task_id]
@@ -150,9 +159,15 @@ def _dependency_report(guild_id):
         """Return the longest upstream blocker chain, from this task to its root dependency."""
         if task_id in visiting:
             return [task_id]
+        if task_id in dependency_chain.cache:
+            return dependency_chain.cache[task_id]
         candidates = [dependency_chain(dep_id, visiting + (task_id,))
                       for dep_id in tasks[task_id]["deps"] if dep_id in tasks]
-        return [task_id] + max(candidates, key=len, default=[])
+        chain = [task_id] + max(candidates, key=len, default=[])
+        dependency_chain.cache[task_id] = chain
+        return chain
+
+    dependency_chain.cache = {}
 
     lines = []
     for task_id, task in tasks.items():
@@ -164,10 +179,14 @@ def _dependency_report(guild_id):
             readiness = "waiting on " + ", ".join(open_deps)
         else:
             readiness = "ready to work on now"
+        path_label = " ← ".join(
+            f"{node} ({', '.join(tasks[node]['owners']) or 'unassigned'})"
+            for node in dependency_chain(task_id)
+        )
         lines.append(
             f"- {task_id}: {task['title']} | owner: {', '.join(task['owners']) or 'unassigned'} | status: {task['status']}\n"
             f"    depends on: {'; '.join(deps) or 'nothing'}\n"
-            f"    dependency path: {' ← '.join(f'{node} ({', '.join(tasks[node]['owners']) or 'unassigned'})' for node in dependency_chain(task_id))}\n"
+            f"    dependency path: {path_label}\n"
             f"    everything upstream: {', '.join(sorted(upstream(task_id))) or 'nothing'}\n"
             f"    holds up: {', '.join(dependents.get(task_id, [])) or 'nothing'}\n"
             f"    {readiness}"
@@ -175,24 +194,12 @@ def _dependency_report(guild_id):
     critical = max((longest_open_chain(t) for t in tasks), key=len, default=[])
     if len(critical) > 1:
         lines.append("Longest chain of unfinished work (critical path): " + " -> ".join(label(t) for t in critical))
-    changes = _task_change_history(guild_id)
-    if changes:
-        lines.append("Recent task changes and their Discord sources:")
-        lines.extend(
-            f"- {change['summary']} | {change['actor_name']} | {change['timestamp']} | "
-            f"[source message]({change['source_url']})"
-            for change in changes
-        )
     return "\n".join(lines)
 
 
 DEPENDENCY_PATH_QUERY = """
-MATCH p=(target:Task {guild_id: $guild_id, id: $task_id})-[:BLOCKED_BY*0..20]->(upstream:Task)
-WHERE all(node IN nodes(p) WHERE node.guild_id = $guild_id)
-WITH p, [node IN nodes(p) | node.id] AS task_ids
-ORDER BY length(p) DESC
-LIMIT 1
-RETURN task_ids
+MATCH (task:Task {guild_id: $guild_id})-[:BLOCKED_BY]->(blocker:Task {guild_id: $guild_id})
+RETURN task.id, blocker.id
 """.strip()
 
 TASK_ASSIGNMENT_SOURCES_QUERY = """
@@ -209,30 +216,76 @@ LIMIT 100
 """.strip()
 
 
+def _aggregate_task_rows(rows):
+    """Collapse _all_tasks' owner/blocker cross product into one stable row per task."""
+    grouped = {}
+    for row in rows:
+        task_id, title, owner, blocker, status = row
+        entry = grouped.setdefault(str(task_id), {
+            "id": str(task_id), "title": title, "owners": set(), "blockers": set(), "status": status,
+        })
+        if owner:
+            entry["owners"].add(str(owner))
+        if blocker:
+            entry["blockers"].add(str(blocker))
+        if not entry["status"] and status:
+            entry["status"] = status
+    return [
+        [entry["id"], entry["title"], sorted(entry["owners"]), sorted(entry["blockers"]), entry["status"]]
+        for entry in grouped.values()
+    ]
+
+
 def _explain_dependency_path(question, guild_id, tasks):
     """Explain the longest blocker chain for `explain <task>` and expose its read-only query."""
     match = re.match(r"^\s*explain\b\s*(.*)$", question, flags=re.IGNORECASE | re.DOTALL)
     if not match:
         return None
-    target_ref = match.group(1).strip().strip("?.,!`*_ ")
+    raw_ref = match.group(1).strip()
+    target_ref = raw_ref.strip("?.,!`*_ ").strip("\"'")
     if not target_ref:
         return "Usage: `@sigmaagent explain T5` (or provide a task title)."
 
-    task = next((row for row in tasks if str(row[0]).casefold() == target_ref.casefold()), None)
-    if task is None:
-        title_matches = [row for row in tasks if str(row[1]).casefold() == target_ref.casefold()]
-        task = title_matches[0] if len(title_matches) == 1 else None
-    if task is None:
+    task_rows = _aggregate_task_rows(tasks)
+    task_matches = [row for row in task_rows if str(row[0]).casefold() == target_ref.casefold()]
+    is_task_id = bool(re.fullmatch(r"T\d+", target_ref, flags=re.IGNORECASE))
+    is_quoted_title = raw_ref.startswith(("\"", "'")) and raw_ref[-1:] == raw_ref[:1]
+    if not task_matches:
+        task_matches = [row for row in task_rows if str(row[1]).casefold() == target_ref.casefold()]
+    if not task_matches and not is_task_id and not is_quoted_title:
+        # Ordinary prose such as "explain why T5 is late" belongs to the normal Q&A flow.
+        return None
+    if not task_matches:
         return f"I couldn't identify one task matching **{target_ref}** in this server's graph."
+    if len(task_matches) > 1:
+        options = ", ".join(f"{row[0]}: {row[1]}" for row in task_matches)
+        return f"**{target_ref}** matches multiple tasks: {options}. Use a task ID to disambiguate."
 
+    task = task_matches[0]
     task_id = str(task[0])
-    params = {"guild_id": str(guild_id), "task_id": task_id}
+    params = {"guild_id": str(guild_id)}
     result = graph.query(DEPENDENCY_PATH_QUERY, params).result_set
-    ids = [str(task_id_value) for task_id_value in (result[0][0] if result else [task_id])]
-    task_by_id = {str(row[0]): row for row in tasks}
+    dependencies = {}
+    for blocked_id, blocker_id in result:
+        dependencies.setdefault(str(blocked_id), []).append(str(blocker_id))
+    task_by_id = {str(row[0]): row for row in task_rows}
+    chain_cache = {}
+
+    def longest_path(current_id, visiting=frozenset()):
+        if current_id in visiting:
+            return [current_id]
+        if current_id in chain_cache:
+            return chain_cache[current_id]
+        candidates = [longest_path(blocker_id, visiting | {current_id})
+                      for blocker_id in dependencies.get(current_id, ()) if blocker_id in task_by_id]
+        path = [current_id] + max(candidates, key=len, default=[])
+        chain_cache[current_id] = path
+        return path
+
+    ids = longest_path(task_id)
     chain = [task_by_id[item] for item in ids if item in task_by_id]
     chain_text = " ← ".join(
-        f"{row[0]}: {row[1]} ({row[2] or 'unassigned'}; {row[4] or 'todo'})"
+        f"{row[0]}: {row[1]} ({', '.join(row[2]) or 'unassigned'}; {row[4] or 'todo'})"
         for row in chain
     ) or f"{task_id}: {task[1]}"
     source_params = {"guild_id": str(guild_id), "task_ids": [row[0] for row in chain]}
@@ -242,19 +295,17 @@ def _explain_dependency_path(question, guild_id, tasks):
         assignment_sources.setdefault(str(source_row[0]), []).append(source_row)
     source_lines = []
     for row in chain:
-        owner = row[2]
-        if not owner:
-            continue
-        event = next((item for item in assignment_sources.get(str(row[0]), [])
-                      if item[1] and str(item[1]).casefold() == str(owner).casefold()
-                      and item[2] and item[4]), None)
-        if event:
-            source_lines.append(
-                f"- {row[0]} owner **{owner}** was assigned by **{event[2]}** "
-                f"([source message]({event[4]}))."
-            )
-        else:
-            source_lines.append(f"- {row[0]} owner **{owner}** has no recorded assignment source.")
+        for owner in row[2]:
+            event = next((item for item in assignment_sources.get(str(row[0]), [])
+                          if item[1] and str(item[1]).casefold() == str(owner).casefold()
+                          and item[2] and item[4]), None)
+            if event:
+                source_lines.append(
+                    f"- {row[0]} owner **{owner}** was assigned by **{event[2]}** "
+                    f"([source message]({event[4]}))."
+                )
+            else:
+                source_lines.append(f"- {row[0]} owner **{owner}** has no recorded assignment source.")
     query_display = (
         f"Dependency path query:\n```cypher\n{DEPENDENCY_PATH_QUERY}\n\n"
         f"// parameters: {json.dumps(params, ensure_ascii=False)}\n```\n"
@@ -278,6 +329,8 @@ def _task_change_history(guild_id, task_id=None, *, action=None, developer_name=
         WHERE ($task_id IS NULL OR event.task_id = $task_id)
           AND ($action IS NULL OR event.action = $action)
           AND ($developer_name IS NULL OR event.developer_name = $developer_name)
+        OPTIONAL MATCH (event)-[:AFFECTS]->(task:Task {guild_id: $guild_id})
+        WHERE $task_id IS NULL OR task.id = $task_id
         OPTIONAL MATCH (event)-[:MADE_BY]->(actor:DiscordAuthor)
         OPTIONAL MATCH (event)-[:TRIGGERED_BY]->(message:DiscordMessage)
         RETURN event.action, event.task_id, event.task_title, event.summary,
@@ -308,31 +361,58 @@ def _ownership_provenance_answer(question, guild_id, tasks):
     if "why" not in lowered or not re.search(r"\b(owner|owned|assign|assigned)\b", lowered):
         return None
     task_match = re.search(r"\bT\d+\b", question, flags=re.IGNORECASE)
+    grouped_tasks = _aggregate_task_rows(tasks)
     if task_match:
-        task = next((row for row in tasks if str(row[0]).casefold() == task_match.group(0).casefold()), None)
+        matches = [row for row in grouped_tasks if row[0].casefold() == task_match.group(0).casefold()]
     else:
-        words = set(re.findall(r"\w+", lowered))
-        task = next((row for row in tasks if words.intersection(
-            set(re.findall(r"\w+", str(row[1]).casefold()))
-        )), None)
-    if not task or not task[2]:
+        matches = [row for row in grouped_tasks
+                   if re.search(rf"(?<!\w){re.escape(str(row[1]))}(?!\w)", question, flags=re.IGNORECASE)]
+    if len(matches) != 1:
         return None
 
-    task_id, title, owner = str(task[0]), str(task[1]), str(task[2])
-    history = _task_change_history(guild_id, task_id, action="assign", developer_name=owner)
-    source = next((item for item in history if item["source_url"] and item["actor_name"]), None)
-    if not source:
-        return (f"I couldn't find a recorded Discord source for the current assignment of "
-                f"**{task_id}: {title}** to **{owner}**.")
-    try:
-        timestamp = datetime.fromisoformat(str(source["timestamp"]).replace("Z", "+00:00"))
-        date = timestamp.strftime("%b %d").replace(" 0", " ")
-    except (TypeError, ValueError):
-        date = "an unknown date"
-    return (
-        f"**{owner}** was assigned to **{task_id}: {title}** by **{source['actor_name']}** "
-        f"on {date} ([source message]({source['source_url']}))."
-    )
+    task_id, title, owners = matches[0][0], matches[0][1], matches[0][2]
+    if not owners:
+        return None
+    lines = [f"Current owner(s) of **{task_id}: {title}**: **{', '.join(owners)}**."]
+    for owner in owners:
+        history = _task_change_history(guild_id, task_id, action="assign", developer_name=owner)
+        source = next((item for item in history if item["source_url"] and item["actor_name"]), None)
+        if not source:
+            lines.append(f"No recorded Discord source for **{owner}**'s assignment.")
+            continue
+        try:
+            timestamp = datetime.fromisoformat(str(source["timestamp"]).replace("Z", "+00:00"))
+            date = timestamp.strftime("%b %d").replace(" 0", " ")
+        except (TypeError, ValueError):
+            date = "an unknown date"
+        lines.append(f"**{owner}** was assigned by **{source['actor_name']}** on {date} "
+                     f"([source message]({source['source_url']})).")
+    return "\n".join(lines)
+
+
+def _relevant_task_change_context(question, guild_id, tasks):
+    """Fetch a small audit trail only for explicit, current tasks in a 'why' question."""
+    if not re.search(r"\bwhy\b", question, flags=re.IGNORECASE):
+        return "(no task-change history requested)"
+    grouped_tasks = _aggregate_task_rows(tasks)
+    ids = {match.casefold() for match in re.findall(r"\bT\d+\b", question, flags=re.IGNORECASE)}
+    matched = [row for row in grouped_tasks if row[0].casefold() in ids]
+    if not matched:
+        matched = [row for row in grouped_tasks
+                   if re.search(rf"(?<!\w){re.escape(str(row[1]))}(?!\w)", question, flags=re.IGNORECASE)]
+    if not matched or len(matched) > 3:
+        return "(no unambiguous current task reference; no task-change history fetched)"
+
+    lines = []
+    for task in matched:
+        for change in _task_change_history(guild_id, task[0]):
+            line = f"- {change['summary']} | {change['actor_name'] or 'unknown author'} | {change['timestamp'] or 'unknown date'}"
+            if change["source_url"]:
+                line += f" | [source message]({change['source_url']})"
+            lines.append(line)
+            if len(lines) >= 12:
+                return "\n".join(lines)
+    return "\n".join(lines) or "(no recorded changes for the referenced task)"
 
 
 def _channel_history(question, discord):
@@ -445,6 +525,35 @@ MERGE (event)-[:TRIGGERED_BY]->(source)
 MERGE (event)-[:AFFECTS]->(t)
 """
 
+TASK_CREATE_AUDIT_QUERY = """
+MERGE (event:TaskChange {id: $event_id})
+ON CREATE SET event.applied = false, event.guild_id = $g, event.action = $event_action,
+    event.details = $event_details, event.summary = $event_summary,
+    event.task_id = $id, event.task_title = $title,
+    event.actor_id = $actor_id, event.actor_name = $actor_name,
+    event.source_message_id = $source_message_id,
+    event.source_channel_id = $source_channel_id, event.source_url = $source_url,
+    event.source_content = $source_content, event.timestamp = $source_timestamp,
+    event.recorded_at = $recorded_at
+WITH event, coalesce(event.applied, false) AS already_applied
+FOREACH (_ IN CASE WHEN already_applied THEN [] ELSE [1] END |
+    CREATE (:Task {id: $id, guild_id: $g, title: $title, status: 'todo', updated_by: $by})
+)
+WITH event
+MATCH (t:Task {id: $id, guild_id: $g})
+MERGE (actor:DiscordAuthor {discord_id: $actor_id})
+SET actor.discord_name = $actor_name
+MERGE (source:DiscordMessage {id: $source_message_id})
+SET source.guild_id = $g, source.channel_id = $source_channel_id,
+    source.content = $source_content, source.timestamp = $source_timestamp,
+    source.source_url = $source_url
+MERGE (actor)-[:AUTHORED]->(source)
+MERGE (event)-[:MADE_BY]->(actor)
+MERGE (event)-[:TRIGGERED_BY]->(source)
+MERGE (event)-[:AFFECTS]->(t)
+SET event.applied = true
+""".strip()
+
 
 def _discord_provenance(discord, guild_id, question):
     """Validate the Discord identity/source fields required for auditable mutations."""
@@ -512,6 +621,17 @@ def _apply_change(guild_id, change, author, provenance, *, index=0, path=""):
     blocked_by = _resolve_task(guild_id, change.blocked_by) or (change.blocked_by or "").strip().upper() or None
     params = {"g": guild_id, "id": task_id, "by": author}
 
+    if provenance is not None:
+        identity = _audit_event_params(
+            guild_id, change, provenance, index=index, path=path, summary="",
+        )
+        previous = graph.query(
+            "MATCH (event:TaskChange {id: $event_id}) RETURN event.summary LIMIT 1",
+            {"event_id": identity["event_id"]},
+        ).result_set
+        if previous:
+            return previous[0][0] or "This Discord change was already applied."
+
     if action == "create":
         if not change.title:
             raise ValueError("a new task needs a title")
@@ -521,11 +641,7 @@ def _apply_change(guild_id, change, author, provenance, *, index=0, path=""):
         params.update(_audit_event_params(
             guild_id, change, provenance, index=index, path=path, summary=result,
         ))
-        graph.query(
-            "CREATE (t:Task {id: $id, guild_id: $g, title: $title, status: 'todo', updated_by: $by})\n"
-            "WITH t\n" + TASK_CHANGE_AUDIT_CLAUSE,
-            params,
-        )
+        graph.query(TASK_CREATE_AUDIT_QUERY, params)
         if change.developer:
             result += "; " + _apply_change(
                 guild_id, TaskChange(action="assign", task_id=task_id, developer=change.developer),
@@ -720,8 +836,9 @@ def _answer_after_changes(gemini, question, guild_id, applied):
     return None if text.upper().startswith("NONE") else text
 
 
-def _ask_gemini(gemini, question, guild_id, messages, author):
+def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
     context = _dependency_report(guild_id)
+    change_context = _relevant_task_change_context(question, guild_id, tasks)
     history = "\n".join(
         f"- [{(m['timestamp'] or '')[:10]}] {m['author']}: {m['content'][:500]} (link: {m['source_url']})"
         for m in messages
@@ -731,7 +848,7 @@ def _ask_gemini(gemini, question, guild_id, messages, author):
         "Answer the question using only the task graph and channel messages below. If the answer isn't in them, say so. "
         "The task graph is the source of truth for owners and blockers; use the messages for extra context "
         "and link to a message when you rely on it, as [date](link). "
-        "For 'why' questions about a task's owner, blocker, or status, use the source-backed task change history; "
+        "For 'why' questions about a task's owner, blocker, or status, use the relevant source-backed task change history below; "
         "name who made the change, when they made it, and link the originating Discord message. "
         "If no matching source-backed change exists, say that the decision has no recorded source; do not guess. "
         "Reply in 1-4 short sentences or a few bullet points (up to about 8 when explaining dependencies). "
@@ -761,6 +878,7 @@ def _ask_gemini(gemini, question, guild_id, messages, author):
         "Every change must have task_id set to an existing task ID (except create).\n"
         "When you make changes, keep `answer` to a short acknowledgement and don't list the changes; they are appended for you.\n\n"
         f"Task graph for this server:\n{context}\n\n"
+        f"Relevant source-backed task changes:\n{change_context}\n\n"
         "If the messages say who is doing what but that isn't in the task graph yet, answer from the messages, "
         "say it isn't tracked as a task yet, and suggest the user ask you to add it.\n\n"
         f"Recent and related messages from this channel (oldest first):\n{history}\n\n"
@@ -796,7 +914,7 @@ def investigate(req: InvestigateRequest):
         try:
             author = discord.get("author_name") or "someone"
             messages = _channel_history(req.question, discord)
-            reply = _ask_gemini(gemini, req.question, guild_id, messages, author)
+            reply = _ask_gemini(gemini, req.question, guild_id, messages, author, tasks)
         except GeminiUnavailable:
             return {"answer": "Gemini is out of free quota or overloaded on every model I can use, "
                               "so I can't answer properly right now; nothing was changed. "

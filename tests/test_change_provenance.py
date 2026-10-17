@@ -23,15 +23,27 @@ class RecordingGraph:
         self.tasks = [["T5", "Build LLM Agent", "Person 3", None, "todo"]]
         self.events = []
         self.queries = []
-        self.dependency_path = ["T5"]
+        self.dependencies = []
+        self.report_rows = []
 
     def query(self, query, params=None):
         params = params or {}
         self.queries.append((query, params))
-        if "[node IN nodes(p) | node.id] AS task_ids" in query:
-            return QueryResult([[self.dependency_path]])
+        if "RETURN task.id, blocker.id" in query:
+            return QueryResult([edge.copy() for edge in self.dependencies])
+        if "RETURN event.summary LIMIT 1" in query:
+            event = next((event for event in self.events if event["id"] == params["event_id"]), None)
+            return QueryResult([[event["summary"]]] if event else [])
+        if "MATCH (event:TaskChange {guild_id: $guild_id, action: 'assign'})" in query:
+            events = [event for event in self.events
+                      if event["guild_id"] == params["guild_id"] and event["action"] == "assign"
+                      and event["task_id"] in params["task_ids"]]
+            return QueryResult([[event["task_id"], event.get("developer_name"), event["actor_name"],
+                                 event["timestamp"], event["source_url"]] for event in events])
         if "RETURN t.id, t.title, d.name, b.title, t.status" in query:
             return QueryResult([row.copy() for row in self.tasks])
+        if "RETURN t.id, t.title, coalesce(t.status, 'todo'), owners" in query:
+            return QueryResult([row.copy() for row in self.report_rows])
         if "MATCH (t:Task {guild_id: $g}) RETURN t.id" in query:
             return QueryResult([[row[0]] for row in self.tasks])
         if "WHERE toLower(d.name) = toLower($name)" in query:
@@ -174,7 +186,7 @@ class ChangeProvenanceTests(unittest.TestCase):
             ["T4", "Build API", "Person 2", "Plan API", "in_progress"],
             ["T3", "Plan API", "Person 3", None, "done"],
         ]
-        self.graph.dependency_path = ["T5", "T4", "T3"]
+        self.graph.dependencies = [["T5", "T4"], ["T4", "T3"]]
         with patch.object(api, "_gemini_client", return_value=None):
             response = self.client.post("/investigate", json={
                 "question": "explain T5", "discord": {"guild_id": self.discord["guild_id"]},
@@ -185,13 +197,111 @@ class ChangeProvenanceTests(unittest.TestCase):
         self.assertIn("T5: Build LLM Agent (Person 4; todo) ← T4: Build API (Person 2; in_progress) ← T3: Plan API (Person 3; done)", answer)
         self.assertIn("Graph query used:", answer)
         self.assertIn("Assignment source query:", answer)
-        self.assertIn("MATCH p=(target:Task", answer)
+        self.assertIn("MATCH (task:Task", answer)
+        self.assertNotIn("BLOCKED_BY*", answer)
         self.assertIn("MATCH (event:TaskChange", answer)
-        self.assertIn('"task_id": "T5"', answer)
+        self.assertIn('"guild_id": "123456789012345678"', answer)
+        self.assertIn('"task_ids": ["T5", "T4", "T3"]', answer)
         query_calls = [(query, params) for query, params in self.graph.queries
-                       if "[node IN nodes(p) | node.id] AS task_ids" in query]
+                       if "RETURN task.id, blocker.id" in query]
         self.assertEqual(len(query_calls), 1)
-        self.assertEqual(query_calls[0][1], {"guild_id": self.discord["guild_id"], "task_id": "T5"})
+        self.assertEqual(query_calls[0][1], {"guild_id": self.discord["guild_id"]})
+
+    def test_replayed_create_change_does_not_create_another_task(self):
+        provenance = api._discord_provenance(self.discord, self.discord["guild_id"], "Create docs task")
+        change = api.TaskChange(action="create", title="Write API Docs")
+        first = api._apply_change(self.discord["guild_id"], change, "Sumit", provenance, index=0)
+        task_count = len(self.graph.tasks)
+        replay = api._apply_change(self.discord["guild_id"], change, "Sumit", provenance, index=0)
+
+        self.assertEqual(first, "Created **T6: Write API Docs**")
+        self.assertEqual(replay, first)
+        self.assertEqual(len(self.graph.tasks), task_count)
+        self.assertEqual(len([event for event in self.graph.events if event["action"] == "create"]), 1)
+
+    def test_explain_title_aggregates_duplicate_rows_and_all_owners(self):
+        self.graph.tasks = [
+            ["T5", "Build LLM Agent", "Person 4", "Build API", "todo"],
+            ["T5", "Build LLM Agent", "Person 6", "Plan API", "todo"],
+            ["T5", "Build LLM Agent", "Person 4", "Plan API", "todo"],
+            ["T4", "Build API", "Person 2", None, "in_progress"],
+            ["T3", "Plan API", "Person 3", None, "done"],
+        ]
+        self.graph.dependencies = [["T5", "T4"], ["T5", "T3"]]
+        with patch.object(api, "_gemini_client", return_value=None):
+            response = self.client.post("/investigate", json={
+                "question": 'explain "Build LLM Agent"',
+                "discord": {"guild_id": self.discord["guild_id"]},
+            })
+        answer = response.json()["answer"]
+        self.assertIn("T5: Build LLM Agent (Person 4, Person 6; todo)", answer)
+        self.assertEqual(answer.count("T5: Build LLM Agent"), 1)
+
+    def test_explain_prose_question_is_not_captured_by_explain_mode(self):
+        reply = api.AgentReply(answer="T5 is late because it is waiting on T4.", changes=[])
+        with patch.object(api, "_gemini_client", return_value=object()), \
+             patch.object(api, "_channel_history", return_value=[]), \
+             patch.object(api, "_ask_gemini", return_value=reply) as ask:
+            response = self.client.post("/investigate", json={
+                "question": "explain why T5 is late",
+                "discord": {"guild_id": self.discord["guild_id"]},
+            })
+        self.assertEqual(response.json()["answer"], reply.answer)
+        ask.assert_called_once()
+
+    def test_owner_why_uses_exact_title_and_includes_all_current_owners(self):
+        rows = [
+            ["T5", "API Integration", "Person 2", None, "todo"],
+            ["T5", "API Integration", "Person 3", "Another API", "todo"],
+            ["T6", "API Service", "Person 4", None, "todo"],
+        ]
+        guild_id = self.discord["guild_id"]
+        self.assertIsNone(api._ownership_provenance_answer("Why is the project blocked?", guild_id, rows))
+        for owner, msg_id, actor, month_day in [
+            ("Person 2", "510000000000000001", "Sumit", "Oct 16"),
+            ("Person 3", "510000000000000002", "Riya", "Oct 17"),
+        ]:
+            self.graph.events.append({
+                "id": msg_id, "guild_id": self.discord["guild_id"], "action": "assign",
+                "task_id": "T5", "task_title": "API Integration", "summary": "Assigned owner",
+                "actor_name": actor, "actor_id": self.discord["author_id"],
+                "timestamp": f"2026-10-{month_day[-2:]}T12:00:00+00:00",
+                "source_url": f"https://discord.com/channels/g/c/{msg_id}",
+                "developer_name": owner, "details": "{}",
+            })
+        answer = api._ownership_provenance_answer("Why is API Integration the owner?", guild_id, rows)
+        self.assertIn("Person 2", answer)
+        self.assertIn("Person 3", answer)
+        self.assertIn("Sumit", answer)
+        self.assertIn("Riya", answer)
+
+    def test_task_change_context_is_fetched_only_for_relevant_why_question(self):
+        rows = [["T5", "Build LLM Agent", "Person 3", None, "todo"]]
+        self.graph.queries.clear()
+        normal = api._relevant_task_change_context("What is T5 doing?", self.discord["guild_id"], rows)
+        self.assertIn("no task-change history requested", normal)
+        self.assertFalse(any("MATCH (event:TaskChange" in query for query, _ in self.graph.queries))
+
+        why = api._relevant_task_change_context("Why is T5 blocked?", self.discord["guild_id"], rows)
+        self.assertIn("no recorded changes", why)
+        history_queries = [query for query, _ in self.graph.queries if "MATCH (event:TaskChange" in query]
+        self.assertEqual(len(history_queries), 1)
+
+    def test_dependency_report_contains_paths_without_global_audit_history(self):
+        self.graph.report_rows = [
+            ["T1", "Frontend", "todo", ["Person 1"], [["T2", False], ["T3", False]]],
+            ["T2", "Auth", "todo", ["Person 2"], [["T4", False]]],
+            ["T3", "Backend", "todo", ["Person 3"], [["T4", False]]],
+            ["T4", "API", "todo", ["Person 4"], [["T5", False]]],
+            ["T5", "Database", "todo", ["Person 5"], []],
+        ]
+        self.graph.queries.clear()
+
+        report = api._dependency_report(self.discord["guild_id"])
+
+        self.assertIn("dependency path: T1 (Person 1) ← T2 (Person 2) ← T4 (Person 4) ← T5 (Person 5)", report)
+        self.assertEqual(len(self.graph.queries), 1)
+        self.assertFalse(any("TaskChange" in query for query, _ in self.graph.queries))
 
     def test_every_mutation_action_writes_its_audit_event(self):
         self.graph.tasks.append(["T6", "Database Setup", "Person 2", None, "todo"])
@@ -309,9 +419,18 @@ class FalkorDbProvenanceIntegrationTests(unittest.TestCase):
                 api.TaskChange(action="create", title="New Provenanced Task"),
             ]
             for index, change in enumerate(remaining_changes, start=1):
-                api._apply_change(guild_id, change, "Sumit", api._discord_provenance(
+                provenance = api._discord_provenance(
                     discord, guild_id, "Provenance operation.",
-                ), index=index)
+                )
+                first_result = api._apply_change(guild_id, change, "Sumit", provenance, index=index)
+                if change.action == "create":
+                    replay_result = api._apply_change(guild_id, change, "Sumit", provenance, index=index)
+                    self.assertEqual(replay_result, first_result)
+                    created_count = graph.query(
+                        "MATCH (t:Task {guild_id: $g, title: 'New Provenanced Task'}) RETURN count(t)",
+                        {"g": guild_id},
+                    ).result_set[0][0]
+                    self.assertEqual(created_count, 1)
             action_rows = graph.query(
                 "MATCH (event:TaskChange {guild_id: $g}) RETURN event.action",
                 {"g": guild_id},
@@ -377,7 +496,7 @@ class FalkorDbDependencyPathIntegrationTests(unittest.TestCase):
             answer = response.json()["answer"]
             self.assertIn("T5: Build LLM Agent (Person 4; todo) ← T4: Build API (Person 2; in_progress) ← T3: Plan API (Person 3; done)", answer)
             self.assertIn("Graph query used:", answer)
-            self.assertIn('"task_id": "T5"', answer)
+            self.assertIn('"guild_id": "123456789012345678"', answer)
             self.assertIn("Source trail:", answer)
             self.assertIn("assigned by **Sumit**", answer)
             self.assertIn("https://discord.com/channels/123456789012345678/234567890123456789/345678901234567890", answer)
