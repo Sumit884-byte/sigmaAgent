@@ -41,6 +41,14 @@ In a server channel, try:
 
 The bot POSTs JSON with `question`, `query`, and Discord message metadata to `INVESTIGATION_API_URL`. Confirm the backend contract with the API owner and adjust `investigate()` in `bot.py` if their route or request schema differs.
 
+## Task change provenance
+
+For task changes, the bot also sends the original message content and Discord message timestamp. The API requires valid guild, channel, message, and author IDs before applying a change. Each applied create, assignment, dependency, status, rename, unassignment, unblock, or delete action is recorded as a `TaskChange` in the same graph query as the mutation. The record links to the triggering `DiscordMessage`, the speaking `DiscordAuthor`, and the affected task (and assigned developer or blocker when applicable). Repeated delivery of the same message and change is idempotent.
+
+For dependency questions, the task graph context includes an ordered blocker path and the owner of each task. In Discord, use `@SigmaAgent explain T5` (replace `T5` with a task ID or exact title) to get that task's longest recorded blocker path and the read-only Cypher query with its parameters. Explain mode does not call the language model or modify graph data.
+
+When asked why a task has its current owner, the API answers from the recorded assignment and includes the speaker, date, and clickable Discord source. If no source-backed assignment exists, it says so instead of guessing.
+
 ## 5. Request/response contract to confirm with backend teammate
 
 Request currently sent:
@@ -55,6 +63,8 @@ Request currently sent:
     "message_id": "…",
     "author_id": "…",
     "author_name": "…",
+    "timestamp": "…",
+    "message_content": "…",
     "message_url": "…"
   }
 }
