@@ -396,21 +396,21 @@ MATCH (u:GitHubUser)-[:AUTHORED]->(c:Commit)-[:TOUCHES]->(f:File)
 WHERE toLower(f.path) CONTAINS $term AND NOT coalesce(c.is_merge, false)
   AND NOT c.message STARTS WITH 'Merge ' AND NOT u.login ENDS WITH '[bot]' AND NOT toLower(u.login) IN $bots
 OPTIONAL MATCH (u)-[:SAME_AS]->(d:Developer)
-RETURN id(coalesce(d, u)) AS pid, coalesce(d.name, '@' + u.login) AS person, 'changed ' + f.path AS kind,
+RETURN id(coalesce(d, u)) AS pid, coalesce(d.name, CASE WHEN u.login STARTS WITH 'git:' THEN u.name ELSE '@' + u.login END) AS person, 'changed ' + f.path AS kind,
        c.message AS label, c.url AS url, 1 AS weight
 UNION ALL
 MATCH (u:GitHubUser)-[:AUTHORED]->(c:Commit)
 WHERE toLower(c.message) CONTAINS $term AND NOT coalesce(c.is_merge, false)
   AND NOT c.message STARTS WITH 'Merge ' AND NOT u.login ENDS WITH '[bot]' AND NOT toLower(u.login) IN $bots
 OPTIONAL MATCH (u)-[:SAME_AS]->(d:Developer)
-RETURN id(coalesce(d, u)) AS pid, coalesce(d.name, '@' + u.login) AS person, 'commit' AS kind,
+RETURN id(coalesce(d, u)) AS pid, coalesce(d.name, CASE WHEN u.login STARTS WITH 'git:' THEN u.name ELSE '@' + u.login END) AS person, 'commit' AS kind,
        c.message AS label, c.url AS url, 1 AS weight
 UNION ALL
 MATCH (u:GitHubUser)-[r:OPENED|ASSIGNED]->(i:Issue)
 WHERE (toLower(i.title) CONTAINS $term OR any(l IN i.labels WHERE toLower(l) CONTAINS $term))
   AND NOT u.login ENDS WITH '[bot]' AND NOT toLower(u.login) IN $bots
 OPTIONAL MATCH (u)-[:SAME_AS]->(d:Developer)
-RETURN id(coalesce(d, u)) AS pid, coalesce(d.name, '@' + u.login) AS person,
+RETURN id(coalesce(d, u)) AS pid, coalesce(d.name, CASE WHEN u.login STARTS WITH 'git:' THEN u.name ELSE '@' + u.login END) AS person,
        CASE WHEN type(r) = 'ASSIGNED' THEN 'assigned issue' ELSE 'opened issue' END AS kind,
        '#' + toString(i.number) + ' ' + i.title AS label, i.url AS url,
        CASE WHEN type(r) = 'ASSIGNED' THEN 3 ELSE 2 END AS weight
@@ -513,7 +513,7 @@ def refresh_expertise(graph: Any) -> int:
 def experts_overview(graph: Any, limit: int = 15) -> list[tuple[str, list[tuple[str, float]]]]:
     rows = graph.ro_query("""
     MATCH (p)-[e:EXPERT_IN]->(t:Topic)
-    WITH t, CASE WHEN 'GitHubUser' IN labels(p) THEN '@' + p.login ELSE coalesce(p.name, p.discord_name) END AS person,
+    WITH t, CASE WHEN 'GitHubUser' IN labels(p) AND NOT p.login STARTS WITH 'git:' THEN '@' + p.login ELSE coalesce(p.name, p.discord_name) END AS person,
          e.score AS score
     ORDER BY score DESC
     WITH t, collect([person, score]) AS people, max(score) AS best

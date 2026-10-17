@@ -451,6 +451,10 @@ EXPERTISE_RE = re.compile(
     r"\s+(?:about|on|in|with|for|regarding)?\s*(?P<topic>.+?)\s*[?.!]*\s*$",
     re.IGNORECASE,
 )
+TEAM_MEMBER_RE = re.compile(
+    r"^\s*(?:is|are)\s+(?P<person>.+?)\s+(?:on|in|part\s+of)\s+(?:the\s+)?(?P<team>.+?)\s+team\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
 TEAMS_RE = re.compile(
     r"^\s*(?:(?:list\s+)?teams|who(?:'s|\s+is|\s+are)\s+(?:on|in)\s+(?:the\s+)?(?P<team>.+?)\s+team)\s*[?.!]*\s*$",
     re.IGNORECASE,
@@ -461,6 +465,7 @@ SYNC_RE = re.compile(
 )
 PEOPLE_STATEMENT_RE = re.compile(
     r"\b(?:is|are|'s)\s+[^.?!\n]{1,40}?\s+on\s+github\b|\bgithub\s+(?:user(?:name)?|handle|account|login|id)\b|"
+    r"\bgithub\s+(?:is|=|:)\s*@?[A-Za-z0-9-]+|\bon\s+github\s+as\s+@?[A-Za-z0-9-]+|"
     r"\blink\s+(?:github|@?[\w-]+\s+to)\b|\b(?:joined|left|is\s+on|are\s+on|moved\s+to)\s+(?:the\s+)?[\w -]+\s+team\b",
     re.IGNORECASE,
 )
@@ -510,6 +515,20 @@ def _expertise_answer(question, guild_id, discord):
 
 
 def _teams_answer(question, guild_id):
+    member = TEAM_MEMBER_RE.match(question)
+    if member:
+        key = " ".join(member.group("team").split()).casefold()
+        rows = {name.casefold(): (name, people) for name, people in knowledge.teams(tenant_graph(guild_id))}
+        if key not in rows:
+            return f"There's no **{member.group('team')}** team yet."
+        team_name, people = rows[key]
+        asked = [name.strip() for name in re.split(r",|\band\b", member.group("person")) if name.strip()]
+        lines = []
+        for name in asked:
+            found = next((p for p in people if p.casefold() == name.casefold()), None)
+            lines.append(f"Yes, **{found}** is on the **{team_name}** team." if found
+                         else f"No, **{name}** isn't on the **{team_name}** team.")
+        return "\n".join(lines) + f"\nMembers: {', '.join(people) or 'none'}."
     match = TEAMS_RE.match(question)
     if not match:
         return None
@@ -842,14 +861,24 @@ def _developer_name(guild_id, name):
 def _resolve_task(guild_id, ref):
     """Turn 'T2', 't2' or a task title into this server's task ID; None if there's no such task."""
     graph = tenant_graph(guild_id)
-    ref = (ref or "").strip()
+    # Model output can carry quotes, zero-width characters or words like "the ... task"
+    ref = re.sub(r"[\u200b-\u200f\ufeff\"'`*]", "", ref or "")
+    ref = re.sub(r"(?i)^\s*(?:the\s+)?(.*?)(?:\s+task)?\s*$", r"\1", " ".join(ref.split()))
     if not ref:
         return None
     if _task_exists(guild_id, ref.upper()):
         return ref.upper()
     match = graph.query("MATCH (t:Task {guild_id: $g}) WHERE toLower(t.title) = toLower($title) RETURN t.id LIMIT 1",
                         {"g": guild_id, "title": ref}).result_set
-    return match[0][0] if match else None
+    if match:
+        return match[0][0]
+    # Fall back to a unique partial title match ("checkout" -> "Checkout Flow"), never a guess between several
+    partial = graph.query("""
+    MATCH (t:Task {guild_id: $g})
+    WHERE toLower(t.title) CONTAINS toLower($title) OR toLower($title) CONTAINS toLower(t.title)
+    RETURN t.id LIMIT 2
+    """, {"g": guild_id, "title": ref}).result_set
+    return partial[0][0] if len(partial) == 1 else None
 
 
 def _task_exists(guild_id, task_id):
@@ -1294,6 +1323,10 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
         "People changes: join_team (developer, team) / leave_team (developer, team) when a message says someone is on, "
         "joined or left a team; link_github (developer, github_login) when it says a GitHub username belongs to someone. "
         "These need no task_id.\n"
+        "One message can contain several changes of different kinds; include every one. For example "
+        "'Sam will build the billing API, and he's on the payments team' needs a create (title 'Billing API', developer 'Sam') "
+        "AND a join_team (developer 'Sam', team 'payments'). Before answering, re-read the message and check that each "
+        "stated fact about tasks, owners, dependencies, teams or GitHub accounts has its own change.\n"
         "Docs, commits and issues: when they answer the question, cite them with their link as [title](link). "
         "For 'who knows about X' questions, suggest asking exactly 'who knows about X' for a ranked, evidence-backed answer.\n"
         "Dependencies: 'depends on' means the task can't finish until those are done. When explaining dependencies, "
@@ -1396,6 +1429,7 @@ def investigate(req: InvestigateRequest):
                     )
                     print(f"[{guild_id}] {author}: {change.model_dump(exclude_none=True)}")
                 except ValueError as exc:
+                    print(f"[{guild_id}] rejected change {change.model_dump(exclude_none=True)!r}: {exc}")
                     target = (" ".join(filter(None, [change.developer, change.team, change.github_login]))
                               if change.action in ("join_team", "leave_team", "link_github")
                               else " ".join(filter(None, [change.task_id, change.title])) or "task")

@@ -111,8 +111,15 @@ class CommandPatternTests(unittest.TestCase):
         self.assertIsNone(api.SYNC_RE.match("sync github").group("repo"))
         self.assertIsNone(api.SYNC_RE.match("please sync my calendar"))
 
+    def test_team_membership_questions(self):
+        match = api.TEAM_MEMBER_RE.match("is Sam on the payments team?")
+        self.assertEqual((match.group("person"), match.group("team")), ("Sam", "payments"))
+        self.assertTrue(api.TEAM_MEMBER_RE.match("are Sam and Priya in the platform team"))
+        self.assertIsNone(api.TEAM_MEMBER_RE.match("Sam is on the payments team"))
+
     def test_people_statements_skip_the_github_router(self):
         for statement in ["Naseem77 is Person 1 on github", "my github username is sumit884",
+                          "Meera will handle invoices and her github is meera-dev", "Sam is on github as sam-k",
                           "Priya joined the payments team"]:
             self.assertTrue(api.PEOPLE_STATEMENT_RE.search(statement), statement)
         self.assertFalse(api.PEOPLE_STATEMENT_RE.search("who are the contributors?"))
