@@ -72,6 +72,10 @@ Request currently sent:
 
 The bot understands a plain-text response or common JSON keys: `answer`, `summary`, `response`, `result`, `message`, or `analysis`. If your API uses another shape, add that key in `extract_answer()`.
 
+## GitHub repository questions
+
+SigmaAgent also answers questions about the GitHub repository (default `Sumit884-byte/sigmaAgent`, override with `GITHUB_REPO` in the backend `.env`) from live GitHub data, with links to every source: `who are the contributors?` / `who committed how much?`, `what are the open issues?`, `what bugs are open?`, and `summarize issue #6`. The backend exposes the same data as `GET /github/contributors`, `GET /github/issues` (optional `state` and `label`), and `GET /github/issue/{number}`. Private repositories need `GITHUB_TOKEN` in the backend `.env`.
+
 ## Troubleshooting
 
 - **Bot online but ignores messages:** enable Message Content Intent in the Discord Developer Portal and check that the bot has channel permissions.
