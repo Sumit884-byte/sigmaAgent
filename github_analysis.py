@@ -23,6 +23,17 @@ DEFAULT_REPO = os.getenv("GITHUB_REPO", "Sumit884-byte/sigmaAgent")
 CACHE_TTL_SECONDS = 120
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 ISSUE_NUMBER = re.compile(r"\bissue\s*#?(\d{1,7})\b", re.IGNORECASE)
+# github.com/owner/repo inside a pasted URL; extra path segments are ignored
+GITHUB_URL_REPO = re.compile(r"github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", re.IGNORECASE)
+# github.com/owner/repo/issues/42 or /pull/42 in a pasted URL
+URL_ISSUE_NUMBER = re.compile(
+    r"github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pull)/(\d{1,7})", re.IGNORECASE
+)
+# Bare owner/name ("barchart/marketdata-api-js") — both parts must start with a
+# letter so dates (24/7) and fractions don't look like repositories
+BARE_REPO = re.compile(
+    r"(?<![\w./@])([A-Za-z][A-Za-z0-9_.-]{0,58})/([A-Za-z][A-Za-z0-9_.-]{0,98})(?![\w-])"
+)
 # Substring stems so one entry covers commits/committed/committers, issue/issues, etc.
 HINT_STEMS = ("github", "repo", "repositor", "commit", "contribut", "issue", "bug")
 
@@ -75,6 +86,25 @@ def gh_get(path: str, params: dict[str, str] | None = None) -> Any:
     value = _http_get_json(path, params)
     _CACHE[key] = (now, value)
     return value
+
+
+def extract_repo(question: str) -> str | None:
+    """The repository named in the question: a github.com URL or a bare owner/name."""
+    match = GITHUB_URL_REPO.search(question or "")
+    if match:
+        owner, name = match.group(1), match.group(2)
+    else:
+        match = BARE_REPO.search(question or "")
+        if not match:
+            return None
+        owner, name = match.group(1), match.group(2)
+    return f"{owner}/{name.rstrip('.,;:!?)]}')}"
+
+
+def _issue_number(question: str) -> int | None:
+    """An issue number from a pasted issue URL (github.com/.../issues/42) or 'issue #42'."""
+    match = URL_ISSUE_NUMBER.search(question or "") or ISSUE_NUMBER.search(question or "")
+    return int(match.group(1)) if match else None
 
 
 def _repo_path(repo: str, suffix: str = "") -> str:
@@ -245,14 +275,15 @@ GITHUB_HELP_TEXT = (
 
 def answer_github_question(question: str, repo: str | None = None) -> str | None:
     """Answer a repository question from live GitHub data, or None if it isn't one."""
-    repo = repo or DEFAULT_REPO
     lowered = (question or "").casefold()
     if not any(stem in lowered for stem in HINT_STEMS):
         return None
+    # A repository named in the question (URL or owner/name) wins over the configured default
+    repo = extract_repo(question) or repo or DEFAULT_REPO
     try:
-        number = ISSUE_NUMBER.search(question)
+        number = _issue_number(question)
         if number:
-            return format_issue_summary(repo, get_issue(repo, int(number.group(1))))
+            return format_issue_summary(repo, get_issue(repo, number))
         if "bug" in lowered:
             return format_issues(repo, get_issues(repo, labels=["bug"]), kind="open bugs (labeled `bug`)")
         if "issue" in lowered:

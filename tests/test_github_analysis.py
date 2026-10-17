@@ -12,6 +12,7 @@ from github_analysis import (
     GitHubNotFound,
     GitHubUnavailable,
     answer_github_question,
+    extract_repo,
     format_contributors,
     format_issue_summary,
     format_issues,
@@ -147,6 +148,75 @@ class GitHubAnswerTests(unittest.TestCase):
     def test_empty_states(self):
         self.assertIn("no open issues", format_issues(self.repo, [], kind="open issues"))
         self.assertIn("**0** commits by **0** contributor(s)", format_contributors(self.repo, []))
+
+    def test_repo_url_in_question_wins_over_default(self):
+        asked = []
+
+        def fetch(path, params=None):
+            asked.append(path)
+            return [contributor("barchart-dev", 9)]
+
+        with patch.object(github_analysis, "_http_get_json", side_effect=fetch):
+            answer = answer_github_question(
+                "for the repository, https://github.com/barchart/marketdata-api-js "
+                "who are the contributors?"
+            )
+        self.assertEqual(asked, ["/repos/barchart/marketdata-api-js/contributors"])
+        self.assertIn("**barchart/marketdata-api-js**", answer)
+        self.assertIn("**barchart-dev** — 9 commits", answer)
+        self.assertNotIn(self.repo, answer)
+
+    def test_bare_owner_name_in_question_wins_over_default(self):
+        asked = []
+
+        def fetch(path, params=None):
+            asked.append(path)
+            return [contributor("barchart-dev", 9)]
+
+        with patch.object(github_analysis, "_http_get_json", side_effect=fetch):
+            answer = answer_github_question("who are the contributors to barchart/marketdata-api-js?")
+        self.assertEqual(asked, ["/repos/barchart/marketdata-api-js/contributors"])
+        self.assertIn("**barchart/marketdata-api-js**", answer)
+
+    def test_url_with_trailing_punctuation_is_cleaned(self):
+        self.assertEqual(extract_repo("see https://github.com/barchart/marketdata-api-js."),
+                         "barchart/marketdata-api-js")
+        self.assertEqual(extract_repo("https://github.com/sumit884-byte/sigmaAgent/issues/6 who committed?"),
+                         "sumit884-byte/sigmaAgent")
+
+    def test_issue_url_summarizes_that_issue_on_that_repo(self):
+        asked = []
+
+        def fetch(path, params=None):
+            asked.append(path)
+            if path.endswith("/issues/42"):
+                return issue(42, "WebSocket drops frames", ["bug"])
+            return []
+
+        with patch.object(github_analysis, "_http_get_json", side_effect=fetch):
+            answer = answer_github_question(
+                "summarize https://github.com/barchart/marketdata-api-js/issues/42"
+            )
+        self.assertIn("/repos/barchart/marketdata-api-js/issues/42", asked)
+        self.assertIn("**Issue #42: WebSocket drops frames**", answer)
+
+    def test_numbers_like_dates_are_not_repos(self):
+        asked = []
+
+        def fetch(path, params=None):
+            asked.append(path)
+            return [contributor("Sumit884-byte", 34)]
+
+        with patch.object(github_analysis, "_http_get_json", side_effect=fetch):
+            answer_github_question("who are the contributors? uptime is 24/7")
+        self.assertEqual(asked, [f"/repos/{self.repo}/contributors"])
+
+    def test_unknown_repo_in_url_is_named_in_the_answer(self):
+        with patch.object(github_analysis, "_http_get_json", side_effect=GitHubNotFound("gone")):
+            answer = answer_github_question(
+                "who are the contributors to https://github.com/nobody/nothing-here?"
+            )
+        self.assertIn("couldn't find that on GitHub for **nobody/nothing-here**", answer)
 
 
 _original_falkordb = falkordb.FalkorDB
