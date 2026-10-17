@@ -39,7 +39,10 @@ def require_context_api_key(x_context_api_key: str | None = Header(default=None)
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-def allowed_channel_ids() -> list[str]:
+def allowed_channel_ids() -> list[str] | None:
+    """Allowlisted channel IDs, or None when set to "*" (every channel the bot can read)."""
+    if os.getenv("DISCORD_ALLOWED_CHANNEL_IDS", "").strip() == "*":
+        return None
     allowed = {
         value.strip()
         for value in os.getenv("DISCORD_ALLOWED_CHANNEL_IDS", "").split(",")
@@ -53,8 +56,8 @@ def allowed_channel_ids() -> list[str]:
 
 
 def authorize_channel(channel_id: str) -> None:
-    allowed = set(allowed_channel_ids())
-    if channel_id not in allowed:
+    allowed = allowed_channel_ids()
+    if allowed is not None and channel_id not in allowed:
         raise HTTPException(status_code=403, detail="Channel is not allowed")
 
 
@@ -64,7 +67,9 @@ def _discord_request(path: str, retries: int = 4) -> Any:
         raise RuntimeError("DISCORD_BOT_TOKEN is not configured")
     request = urllib.request.Request(
         f"{DISCORD_API}{path}",
-        headers={"Authorization": f"Bot {token}", "Accept": "application/json"},
+        # Discord's CDN rejects urllib's default User-Agent with HTTP 403 (error 1010)
+        headers={"Authorization": f"Bot {token}", "Accept": "application/json",
+                 "User-Agent": "DiscordBot (https://github.com/Sumit884-byte/sigmaAgent, 0.2.0)"},
     )
     for attempt in range(retries + 1):
         try:

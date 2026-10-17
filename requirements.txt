@@ -1,3 +1,5 @@
 fastapi
 uvicorn
 falkordb
+python-dotenv
+google-genai

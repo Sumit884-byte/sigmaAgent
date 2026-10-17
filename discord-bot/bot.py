@@ -67,6 +67,7 @@ async def investigate(question: str, message: discord.Message) -> str:
             "author_id": str(message.author.id),
             "author_name": str(message.author),
             "message_url": message.jump_url,
+            "bot_name": client.user.name if client.user else None,
         },
     }
     headers = {"Content-Type": "application/json"}
@@ -104,8 +105,12 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Only respond when directly mentioned; avoids replying to every channel message.
-    if client.user not in message.mentions:
+    # Only respond when mentioned; avoids replying to every channel message.
+    # Discord's autocomplete offers both the bot user and its same-named managed role,
+    # so a mention of the bot's role counts too.
+    bot_role = message.guild.self_role if message.guild else None
+    mentioned_role = bot_role is not None and bot_role in message.role_mentions
+    if client.user not in message.mentions and not mentioned_role:
         return
 
     question = message.content
@@ -113,6 +118,8 @@ async def on_message(message: discord.Message):
     if client.user:
         question = question.replace(f"<@{client.user.id}>", "")
         question = question.replace(f"<@!{client.user.id}>", "")
+    if bot_role:
+        question = question.replace(f"<@&{bot_role.id}>", "")
     question = question.strip()
 
     if not question:
