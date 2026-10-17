@@ -17,3 +17,7 @@ GEMINI.md
 .windsurfrules
 .aider*
 .github/copilot-instructions.md
+
+# Local screenshots and credential images
+context retrieval/*.png
+token.png

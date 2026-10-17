@@ -1,0 +1,127 @@
+PERSON 3 IMPLEMENTATION: CONTEXT AND DISCORD HISTORY
+====================================================
+
+PURPOSE
+-------
+This service gives the project agent read-only access to relevant Discord
+conversation context. It imports channel history into a Person 3 FalkorDB
+graph, identifies explicitly stated blockers and decisions, and returns the
+source message and Discord link for review. It does not send Discord messages
+or modify Jira, Linear, or task status.
+
+WHAT IS IMPLEMENTED
+-------------------
+
+1. Discord history import
+   - Imports mock history locally and supports authenticated live Discord
+     channel synchronization.
+   - Uses stable Discord IDs and idempotent graph writes so repeated syncs do
+     not duplicate messages.
+   - Writes in bounded batches to keep memory and database query sizes
+     manageable.
+   - Supports incremental sync and older-history backfill. Incremental sync
+     stores a per-channel continuation cursor and resumes across calls when a
+     message cap is reached, instead of restarting at the same page.
+   - Handles Discord's page size, rate-limit responses, and bounded retries.
+
+2. Evidence extraction and task association
+   - Extracts blocker statements signaled by phrases such as "blocked by",
+     "waiting for", and "cannot proceed until".
+   - Extracts decisions signaled by "Decision:", "decided to", and
+     "agreed to".
+   - Preserves the exact sentence as evidence and links it to its source
+     message.
+   - Associates evidence with a task only when the message explicitly names
+     the task ID or full task title. Title matching respects word boundaries.
+   - Re-importing an edited message removes stale evidence that the updated
+     content no longer supports.
+
+3. Evidence retrieval
+   - Retrieves evidence by task ID through graph relationships, including
+     cases where the evidence text itself does not contain the task ID.
+   - Supports text search and channel filtering.
+   - Returns the evidence excerpt together with source message, author,
+     timestamp, task reference when explicit, and original Discord URL.
+   - Provides direct recent channel-history search without persisting the
+     fetched messages.
+
+4. Shared graph and identity handling
+   - Reads Person 2's Task records and uses the shared Task node schema.
+   - Stores Discord channels, messages, and evidence in the Person 3 graph.
+   - Stores Discord authors in separate `DiscordAuthor` nodes keyed by Discord
+     user ID, with current display names in `discord_name`.
+   - Links to a Person 2 developer only through an explicit
+     `DISCORD_DEVELOPER_MAP` ID-to-name configuration and a `MAPS_TO` edge.
+     The canonical Developer name remains unchanged, and the mapping can be
+     added after the first sync.
+   - Migrates legacy Developer author records, moving their `AUTHORED` edges
+     and removing their Discord ID property.
+   - Indexes Discord author IDs and Developer names for these lookups.
+   - Uses graph indexes and caches graph connections/index discovery per
+     configuration to reduce per-request overhead.
+   - Does not create or change Person 2's blocker or assignee relationships.
+
+5. API security and failure handling
+   - Protects sync, direct channel-history, and retrieval endpoints with an
+     X-Context-API-Key service key.
+   - Requires configured channel allowlisting and validates Discord channel
+     IDs before using them in Discord API requests.
+   - Restricts retrieval results to allowed channels.
+   - Returns sanitized service/database errors instead of exposing raw
+     database exception details.
+
+6. Safe load testing
+   - The synthetic load test uses a dedicated SigmaPerson3LoadTest graph.
+   - An explicit graph name is accepted only when it uses that test prefix,
+     so a development graph selected through FALKORDB_GRAPH is not reused by
+     the load test.
+
+MAIN FILES
+----------
+api.py                 FastAPI routes, Discord sync, pagination, auth.
+graph_store.py         FalkorDB schema, indexing, import, and retrieval.
+evidence.py            Explicit blocker/decision extraction and task matching.
+import_history.py      Mock-history importer for local setup.
+load_test_local.py     Isolated synthetic load test.
+tests/                 Unit, API, pagination, safety, and opt-in integration tests.
+README.md              Full setup, configuration, API, and test instructions.
+.env.example           Names and examples of configuration variables.
+
+VERIFICATION PERFORMED
+----------------------
+- Unit/API tests: 25 passed in the earlier recorded run; real-FalkorDB
+  integration tests are skipped unless explicitly enabled.
+- Latest verification after the review fixes: all 35 tests passed, including
+  six opt-in FalkorDB integration tests against a dedicated test graph.
+  Discord responses were faked; the database integration used FalkorDB.
+- Synthetic scale run: imported 10,000 messages, 1,000 evidence records, and
+  1,000 task links into a dedicated load-test graph. The recorded import rate
+  was approximately 7,260 messages/second; indexed retrieval took about
+  0.066 seconds and verified 20 source URLs.
+
+These are recorded local test results. They do not represent a live Discord
+server test. For current commands and environment setup, see README.md.
+
+LOCAL RUNNING
+-------------
+Install dependencies from this folder:
+
+    pip install -r requirements.txt
+
+Configure your own FalkorDB values and a long random CONTEXT_API_KEY. For live
+Discord sync, also configure DISCORD_BOT_TOKEN and
+DISCORD_ALLOWED_CHANNEL_IDS. To connect Discord identities to existing Person 2
+developers, set DISCORD_DEVELOPER_MAP to a JSON object mapping Discord user IDs
+to exact Developer names. Do not share or commit real credentials.
+
+Run the mock importer and start the API:
+
+    python import_history.py
+    python -m uvicorn api:app --host 127.0.0.1 --port 8001
+
+Run the tests:
+
+    python -m unittest discover -s tests
+
+For the complete endpoint examples, graph schema, configuration, and optional
+real-FalkorDB integration instructions, refer to README.md in this folder.

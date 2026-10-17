@@ -7,14 +7,23 @@ from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from falkordb import FalkorDB
 from google import genai
 from google.genai import errors as genai_errors
 from pydantic import BaseModel
 
-load_dotenv()
+from github_analysis import (
+    GitHubNotFound,
+    GitHubUnavailable,
+    answer_github_question,
+    format_friend_competition,
+    get_contributors,
+    get_issue,
+    get_issues,
+)
 
+load_dotenv()
 
 
 def _gemini_client():
@@ -81,6 +90,65 @@ RETURN t.title, b.title, d.name
         })
         
     return {"status": "success", "data": dependencies}
+
+
+# GitHub repository analysis (contributors, commits, issues, issue summaries)
+GITHUB_REPO = os.getenv("GITHUB_REPO", "Sumit884-byte/sigmaAgent")
+
+
+def _github_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, GitHubNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    return HTTPException(status_code=503, detail=str(exc))
+
+
+@app.get("/github/contributors")
+def github_contributors(repo: str = GITHUB_REPO):
+    """Contributors of a repository with commit counts, busiest first."""
+    try:
+        return {"status": "success", "repo": repo, "data": get_contributors(repo)}
+    except (GitHubNotFound, GitHubUnavailable) as exc:
+        raise _github_http_error(exc) from exc
+
+
+@app.get("/github/issues")
+def github_issues(repo: str = GITHUB_REPO, state: str = "open", label: str | None = None,
+                  labels: str | None = None, author: str | None = None, assignee: str | None = None,
+                  unassigned: bool = False):
+    """Issues (pull requests excluded); filter with state=open|closed|all, label(s), author, assignee, unassigned."""
+    if labels:
+        label_list = [part.strip() for part in labels.split(",") if part.strip()]
+    else:
+        label_list = [label] if label else None
+    try:
+        return {"status": "success", "repo": repo,
+                "data": get_issues(repo, state=state, labels=label_list, author=author, assignee=assignee, unassigned=unassigned)}
+    except (GitHubNotFound, GitHubUnavailable) as exc:
+        raise _github_http_error(exc) from exc
+
+
+@app.get("/github/compare")
+def github_compare(users: str, repo: str = GITHUB_REPO):
+    """Compare multiple contributors/friends for open source competition and collaboration tracking."""
+    user_list = [u.strip() for u in users.split(",") if u.strip()]
+    if len(user_list) < 2:
+        raise HTTPException(status_code=400, detail="Provide at least two comma-separated users to compare.")
+    try:
+        contributors = get_contributors(repo)
+        issues = get_issues(repo, state="all")
+        result = format_friend_competition(repo, user_list, contributors, issues)
+        return {"status": "success", "repo": repo, "users": user_list, "summary": result}
+    except (GitHubNotFound, GitHubUnavailable) as exc:
+        raise _github_http_error(exc) from exc
+
+
+@app.get("/github/issue/{number}")
+def github_issue(number: int, repo: str = GITHUB_REPO):
+    """One issue with its body and latest comments."""
+    try:
+        return {"status": "success", "repo": repo, "data": get_issue(repo, number)}
+    except (GitHubNotFound, GitHubUnavailable) as exc:
+        raise _github_http_error(exc) from exc
 
 
 # 4. Investigation endpoint used by the Discord bot
@@ -1021,6 +1089,10 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
 @app.post("/investigate")
 def investigate(req: InvestigateRequest):
     discord = req.discord or {}
+    # Repository questions don't depend on a server's task graph, so answer them first
+    github_answer = answer_github_question(req.question)
+    if github_answer is not None:
+        return {"answer": github_answer}
     # Requests from outside Discord (e.g. curl) use the default server
     guild_id = discord.get("guild_id") if req.discord else os.getenv("DISCORD_GUILD_ID")
     if not guild_id:
