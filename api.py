@@ -13,6 +13,7 @@ from google import genai
 from google.genai import errors as genai_errors
 from pydantic import BaseModel
 
+import knowledge
 from github_analysis import (
     GitHubNotFound,
     GitHubUnavailable,
@@ -63,6 +64,7 @@ def tenant_graph(guild_id):
             except Exception as exc:
                 if "already indexed" not in str(exc).casefold():
                     raise
+        knowledge.ensure_indexes(graph)
         _tenant_graphs[name] = graph
     return _tenant_graphs[name]
 
@@ -152,6 +154,24 @@ def github_issue(number: int, repo: str = GITHUB_REPO):
 
 
 # 4. Investigation endpoint used by the Discord bot
+class KnowledgeSyncRequest(BaseModel):
+    guild_id: str
+    repo: str | None = None
+    max_commits: int | None = None
+
+
+@app.post("/knowledge/sync")
+def knowledge_sync(req: KnowledgeSyncRequest):
+    """Pull a GitHub repo's commits, issues/PRs and Markdown docs into one server's graph."""
+    try:
+        graph = tenant_graph(req.guild_id)
+        return knowledge.sync_repository(graph, req.repo or GITHUB_REPO, max_commits=req.max_commits)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (GitHubNotFound, GitHubUnavailable) as exc:
+        raise _github_http_error(exc) from exc
+
+
 class InvestigateRequest(BaseModel):
     question: str
     # Sent by the Discord bot: guild_id, channel_id, message_id, bot_name, ...
@@ -159,13 +179,17 @@ class InvestigateRequest(BaseModel):
 
 
 class TaskChange(BaseModel):
-    action: str  # create | assign | unassign | block | unblock | set_status | rename | delete
+    # create | assign | unassign | block | unblock | set_status | rename | delete
+    # | join_team | leave_team | link_github
+    action: str
     task_id: str | None = None  # existing task ID; leave empty for create
     title: str | None = None  # for create / rename
     developer: str | None = None  # for create / assign
     blocked_by: str | None = None  # ID of the blocking task, for create / block / unblock
     status: str | None = None  # todo | in_progress | done, for set_status
     inferred: bool | None = None  # block only: dependency guessed from the kind of work, not stated
+    team: str | None = None  # for join_team / leave_team
+    github_login: str | None = None  # for link_github
 
 
 class AgentReply(BaseModel):
@@ -178,7 +202,8 @@ HELP_TEXT = (
     "- `what is blocked?` / `why is X delayed?`\n"
     "- `what is <developer> working on?`\n"
     "- `list tasks`\n"
-    "- `impact T3` / `bottlenecks` / `explain T5` (shows the graph query)"
+    "- `impact T3` / `bottlenecks` / `explain T5` (shows the graph query)\n"
+    "- `who knows about billing?` / `experts` / `teams` / `sync github owner/repo`"
 )
 
 
@@ -375,6 +400,110 @@ def _bottleneck_answer(question, guild_id):
         lines.append("People others are waiting on: " + ", ".join(
             f"**{name}** ({p['waiting']} task(s) via {', '.join(p['tasks'])})" for name, p in people))
     return "\n".join(lines) + f"\n\nGraph query used:\n{_cypher_block(BOTTLENECK_QUERY, {})}"
+
+
+EXPERTS_OVERVIEW_RE = re.compile(r"^\s*(?:experts|who\s+knows\s+what)\s*[?.!]*\s*$", re.IGNORECASE)
+EXPERTISE_RE = re.compile(
+    r"^\s*(?:who\s+(?:knows|understands)(?:\s+(?:the\s+)?most)?|"
+    r"who(?:'s|\s+is)\s+(?:the\s+|an\s+|our\s+)?(?:expert|go-to(?:\s+person)?|best\s+person)|"
+    r"who\s+should\s+i\s+(?:ask|talk\s+to)|who\s+can\s+help(?:\s+me)?|experts?)"
+    r"\s+(?:about|on|in|with|for|regarding)?\s*(?P<topic>.+?)\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+TEAMS_RE = re.compile(
+    r"^\s*(?:(?:list\s+)?teams|who(?:'s|\s+is|\s+are)\s+(?:on|in)\s+(?:the\s+)?(?P<team>.+?)\s+team)\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+SYNC_RE = re.compile(
+    r"^\s*sync\s+(?:github|repo|knowledge|docs)(?:\s+(?:repo\s+)?(?P<repo>[A-Za-z0-9][\w-]*/[\w.-]+))?\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+PEOPLE_STATEMENT_RE = re.compile(
+    r"\b(?:is|are|'s)\s+[^.?!\n]{1,40}?\s+on\s+github\b|\bgithub\s+(?:user(?:name)?|handle|account|login|id)\b|"
+    r"\blink\s+(?:github|@?[\w-]+\s+to)\b|\b(?:joined|left|is\s+on|are\s+on|moved\s+to)\s+(?:the\s+)?[\w -]+\s+team\b",
+    re.IGNORECASE,
+)
+EVIDENCE_PATHS = (
+    "(Developer)-[:ASSIGNED_TO]->(Task) · (Developer)-[:MEMBER_OF]->(Team) · "
+    "(GitHubUser)-[:AUTHORED]->(Commit)-[:TOUCHES]->(File) · (GitHubUser)-[:OPENED|ASSIGNED]->(Issue) · "
+    "(DocSection)-[:MENTIONS]->(Developer) · (DiscordAuthor)-[:AUTHORED]->(DiscordMessage)"
+)
+
+
+def _evidence_line(item):
+    label = " ".join(str(item["label"]).split())[:90]
+    text = f"{item['kind']}: {label}" if label else item["kind"]
+    return f"[{text}]({item['url']})" if item["url"] else text
+
+
+def _expertise_answer(question, guild_id, discord):
+    """`who knows about X`: people ranked by graph evidence, each with linked proof."""
+    if EXPERTS_OVERVIEW_RE.match(question):
+        graph = tenant_graph(guild_id)
+        knowledge.refresh_expertise(graph)
+        overview = knowledge.experts_overview(graph)
+        if not overview:
+            return ("I don't have enough evidence for who knows what yet. "
+                    "Run `sync github owner/repo` to bring in commits, issues and docs.")
+        lines = ["Who knows what (strongest evidence first):"]
+        lines += [f"- **{topic}**: " + ", ".join(f"**{name}** ({score:g})" for name, score in people)
+                  for topic, people in overview]
+        return "\n".join(lines) + "\n\nAsk `who knows about <topic>` to see the evidence behind any of these."
+    match = EXPERTISE_RE.match(question)
+    if not match:
+        return None
+    topic = re.sub(r"(?i)^(?:the|a|an|our|my|this|that)\s+", "", match.group("topic").strip("\"'`*_ "))
+    if not topic or not knowledge.search_terms(topic):
+        return "Usage: `@sigmaagent who knows about billing?`"
+    ranked = knowledge.expertise(tenant_graph(guild_id), topic, exclude=[discord.get("bot_name") or "sigmaagent"])
+    if not ranked:
+        return (f"I couldn't find anyone linked to **{topic}** in this server's tasks, teams, commits, issues, "
+                "docs or chat. If the code lives on GitHub, run `sync github owner/repo` first.")
+    lines = [f"Who knows about **{topic}** (ranked by evidence in the graph):"]
+    for rank, person in enumerate(ranked, 1):
+        evidence = "; ".join(_evidence_line(item) for item in person["evidence"][:3])
+        more = len(person["evidence"]) - 3
+        lines.append(f"{rank}. **{person['person']}** (score {person['score']:g}): {evidence}"
+                     + (f"; +{more} more" if more > 0 else ""))
+    return "\n".join(lines) + f"\n\nEvidence paths searched: {EVIDENCE_PATHS}"
+
+
+def _teams_answer(question, guild_id):
+    match = TEAMS_RE.match(question)
+    if not match:
+        return None
+    rows = knowledge.teams(tenant_graph(guild_id))
+    wanted = match.group("team")
+    if wanted:
+        key = re.sub(r"(?i)\s+team$", "", " ".join(wanted.split())).casefold()
+        rows = [row for row in rows if row[0].casefold() == key]
+        if not rows:
+            return f"There's no **{wanted}** team yet. Say e.g. `Priya is on the {wanted} team` to create it."
+    if not rows:
+        return "No teams yet. Tell me who's on which team, e.g. `@sigmaagent Priya is on the payments team`."
+    return "\n".join(f"- **{name}**: {', '.join(members) or 'no members'}" for name, members in rows)
+
+
+def _sync_answer(question, guild_id):
+    match = SYNC_RE.match(question)
+    if not match:
+        return None
+    graph = tenant_graph(guild_id)
+    stored = graph.ro_query(
+        "MATCH (r:Repository) RETURN r.full_name ORDER BY r.synced_at DESC LIMIT 1").result_set
+    repo = match.group("repo") or (stored[0][0] if stored else GITHUB_REPO)
+    try:
+        counts = knowledge.sync_repository(graph, repo)
+    except GitHubNotFound:
+        return (f"I couldn't find **{repo}** on GitHub. If it's private, set `GITHUB_TOKEN` in the backend `.env`.")
+    except GitHubUnavailable as exc:
+        return f"I couldn't reach GitHub: {exc}. Nothing was changed."
+    answer = (f"Synced **{repo}** into this server's graph: {counts['commits']} commits, "
+              f"{counts['issues']} issues/PRs, {counts['documents']} docs ({counts['sections']} sections), "
+              f"expertise for {counts['topics']} topics. Try `who knows about <topic>` or `experts`.")
+    if counts["warnings"]:
+        answer += "\nNote: " + "; ".join(counts["warnings"][:3])
+    return answer
 
 
 DEPENDENCY_PATH_QUERY = """
@@ -801,6 +930,69 @@ def _audit_event_params(guild_id, change, provenance, *, index, path, summary, d
     }
 
 
+# Team and GitHub-identity changes are audited like task changes, without an affected task
+PEOPLE_CHANGE_AUDIT_CLAUSE = (
+    TASK_CHANGE_AUDIT_CLAUSE
+    .replace("    event.task_id = t.id, event.task_title = t.title,\n", "")
+    .replace("MERGE (event)-[:AFFECTS]->(t)\n", "")
+)
+assert "t.id" not in PEOPLE_CHANGE_AUDIT_CLAUSE and "(t)" not in PEOPLE_CHANGE_AUDIT_CLAUSE
+
+
+def _apply_people_change(graph, guild_id, change, author, provenance, *, index, path):
+    """join_team / leave_team / link_github, each recorded with its Discord source."""
+    if not change.developer:
+        raise ValueError("no person given")
+    params = {"g": guild_id, "by": author, "dev": _developer_name(guild_id, change.developer)}
+    if change.action in ("join_team", "leave_team"):
+        if not change.team or not change.team.strip():
+            raise ValueError("no team given")
+        team_name = " ".join(change.team.split())
+        team_name = re.sub(r"(?i)\s+team$", "", team_name) or team_name
+        existing = graph.ro_query("MATCH (team:Team {key: $key}) RETURN team.name", {"key": team_name.casefold()}).result_set
+        team_name = existing[0][0] if existing else team_name
+        params.update(team=team_name, team_key=team_name.casefold())
+        if change.action == "join_team":
+            summary = f"**{params['dev']}** joined the **{team_name}** team"
+            mutation = """
+            MERGE (d:Developer {name: $dev})
+            MERGE (team:Team {key: $team_key}) ON CREATE SET team.name = $team
+            MERGE (d)-[:MEMBER_OF]->(team)
+            WITH d, team
+            """
+        else:
+            summary = f"**{params['dev']}** left the **{team_name}** team"
+            mutation = """
+            MATCH (d:Developer {name: $dev}), (team:Team {key: $team_key})
+            OPTIONAL MATCH (d)-[m:MEMBER_OF]->(team)
+            DELETE m
+            WITH DISTINCT d, team
+            """
+        tail = "MERGE (event)-[:AFFECTS_DEVELOPER]->(d) MERGE (event)-[:AFFECTS_TEAM]->(team)"
+    else:  # link_github
+        login = (change.github_login or "").strip().lstrip("@")
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", login):
+            raise ValueError("no valid GitHub username given")
+        params["login"] = login
+        summary = f"Linked GitHub **@{login}** to **{params['dev']}**"
+        mutation = """
+        MERGE (d:Developer {name: $dev})
+        MERGE (u:GitHubUser {login: $login})
+        MERGE (u)-[:SAME_AS]->(d)
+        WITH d, u
+        """
+        tail = "MERGE (event)-[:AFFECTS_DEVELOPER]->(d)"
+    params.update(_audit_event_params(
+        guild_id, change, provenance, index=index, path=path, summary=summary, developer_name=params["dev"],
+    ))
+    if change.action == "leave_team" and not graph.ro_query(
+            "MATCH (:Developer {name: $dev})-[:MEMBER_OF]->(:Team {key: $team_key}) RETURN 1",
+            {"dev": params["dev"], "team_key": params["team_key"]}).result_set:
+        raise ValueError(f"{params['dev']} isn't on the {params['team']} team")
+    graph.query(mutation + PEOPLE_CHANGE_AUDIT_CLAUSE + tail, params)
+    return summary
+
+
 def _apply_change(guild_id, change, author, provenance, *, index=0, path=""):
     """Apply one change to this server's tasks and describe it, or raise ValueError."""
     graph = tenant_graph(guild_id)
@@ -841,6 +1033,9 @@ def _apply_change(guild_id, change, author, provenance, *, index=0, path=""):
                 author, provenance, index=index, path=f"{path}/block",
             )
         return result
+
+    if action in ("join_team", "leave_team", "link_github"):
+        return _apply_people_change(graph, guild_id, change, author, provenance, index=index, path=path)
 
     if not task_id or not _task_exists(guild_id, task_id):
         raise ValueError(f"task {task_id or '(none given)'} doesn't exist in this server")
@@ -1027,6 +1222,7 @@ def _answer_after_changes(gemini, question, guild_id, applied):
 def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
     context = _dependency_report(guild_id)
     change_context = _relevant_task_change_context(question, guild_id, tasks)
+    knowledge_context = knowledge.knowledge_context(tenant_graph(guild_id), question)
     history = "\n".join(
         f"- [{(m['timestamp'] or '')[:10]}] {m['author']}: {m['content'][:500]} (link: {m['source_url']})"
         for m in messages
@@ -1051,6 +1247,11 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
         "when one person is given several pieces of work ('person 4 will do testing and the CI/CD pipeline'), "
         "create each task with that same developer. Each change is applied separately, so include every field it needs. "
         "Write task titles as short Title Case names (e.g. 'Auth', 'CI/CD Pipeline').\n"
+        "People changes: join_team (developer, team) / leave_team (developer, team) when a message says someone is on, "
+        "joined or left a team; link_github (developer, github_login) when it says a GitHub username belongs to someone. "
+        "These need no task_id.\n"
+        "Docs, commits and issues: when they answer the question, cite them with their link as [title](link). "
+        "For 'who knows about X' questions, suggest asking exactly 'who knows about X' for a ranked, evidence-backed answer.\n"
         "Dependencies: 'depends on' means the task can't finish until those are done. When explaining dependencies, "
         "show the ordered dependency path (for example T5 ← T4 ← T3) and the owner of each step, "
         "say which tasks are ready to start now, "
@@ -1067,10 +1268,11 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
         "(e.g. 'T2 doesn't depend on T3'). Inferred dependencies already in the graph are marked [inferred].\n"
         "When the user asks for a change, always put it in `changes` even if you think it's a bad idea; "
         "the system validates every change (missing tasks, dependency loops) and tells the user why one is rejected. "
-        "Every change must have task_id set to an existing task ID (except create).\n"
+        "Every task change must have task_id set to an existing task ID (except create).\n"
         "When you make changes, keep `answer` to a short acknowledgement and don't list the changes; they are appended for you.\n\n"
         f"Task graph for this server:\n{context}\n\n"
         f"Relevant source-backed task changes:\n{change_context}\n\n"
+        f"Related docs, commits, issues and teams:\n{knowledge_context}\n\n"
         "If the messages say who is doing what but that isn't in the task graph yet, answer from the messages, "
         "say it isn't tracked as a task yet, and suggest the user ask you to add it.\n\n"
         f"Recent and related messages from this channel (oldest first):\n{history}\n\n"
@@ -1089,8 +1291,19 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
 @app.post("/investigate")
 def investigate(req: InvestigateRequest):
     discord = req.discord or {}
-    # Repository questions don't depend on a server's task graph, so answer them first
-    github_answer = answer_github_question(req.question)
+    # Requests from outside Discord (e.g. curl) use the default server
+    server_id = discord.get("guild_id") if req.discord else os.getenv("DISCORD_GUILD_ID")
+    if server_id:
+        for command in (_sync_answer, _teams_answer):
+            command_answer = command(req.question, server_id)
+            if command_answer is not None:
+                return {"answer": command_answer}
+        expertise_answer = _expertise_answer(req.question, server_id, discord)
+        if expertise_answer is not None:
+            return {"answer": expertise_answer}
+    # Repository questions don't depend on a server's task graph, so answer them next
+    is_people_statement = PEOPLE_STATEMENT_RE.search(req.question) and not req.question.rstrip().endswith("?")
+    github_answer = None if is_people_statement else answer_github_question(req.question)
     if github_answer is not None:
         return {"answer": github_answer}
     # Requests from outside Discord (e.g. curl) use the default server
@@ -1137,7 +1350,9 @@ def investigate(req: InvestigateRequest):
                     )
                     print(f"[{guild_id}] {author}: {change.model_dump(exclude_none=True)}")
                 except ValueError as exc:
-                    target = " ".join(filter(None, [change.task_id, change.title])) or "task"
+                    target = (" ".join(filter(None, [change.developer, change.team, change.github_login]))
+                              if change.action in ("join_team", "leave_team", "link_github")
+                              else " ".join(filter(None, [change.task_id, change.title])) or "task")
                     lines.append(f"- Couldn't {change.action.replace('_', ' ')} {target}: {exc}")
             answer = reply.answer.strip()
             if applied and "?" in req.question:
