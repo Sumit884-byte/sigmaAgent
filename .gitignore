@@ -5,6 +5,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+sigma_venv/
 
 # AI assistant files
 .claude/
@@ -21,3 +22,4 @@ GEMINI.md
 # Local screenshots and credential images
 context retrieval/*.png
 token.png
+token.txt

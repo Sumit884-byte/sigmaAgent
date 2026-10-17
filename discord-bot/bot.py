@@ -94,7 +94,7 @@ async def send_long_message(channel: discord.abc.Messageable, text: str) -> None
     # Discord messages have a 2,000-character limit.
     text = text.strip() or "The investigation API returned no answer."
     for start in range(0, len(text), 1900):
-        await channel.send(text[start : start + 1900])
+        await channel.send(text[start : start + 1900], suppress_embeds=True)
 
 
 @client.event
