@@ -15,12 +15,15 @@ from urllib.parse import urlencode
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from dotenv import load_dotenv
 
 from graph_store import (
     connect_graph, import_messages, latest_message_id, oldest_message_id,
     retrieve_evidence, save_sync_progress, sync_progress,
 )
 from models import DISCORD_CHANNEL_ID_PATTERN, ContextRequest, DiscordMessage
+
+load_dotenv()
 
 app = FastAPI(title="Sigma Agent Context Retrieval API", version="0.2.0")
 DISCORD_API = "https://discord.com/api/v10"

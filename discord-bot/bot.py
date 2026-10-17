@@ -66,6 +66,8 @@ async def investigate(question: str, message: discord.Message) -> str:
             "message_id": str(message.id),
             "author_id": str(message.author.id),
             "author_name": str(message.author),
+            "timestamp": message.created_at.isoformat(),
+            "message_content": message.content,
             "message_url": message.jump_url,
             "bot_name": client.user.name if client.user else None,
         },
