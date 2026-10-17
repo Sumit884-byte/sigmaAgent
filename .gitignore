@@ -17,3 +17,6 @@ GEMINI.md
 .windsurfrules
 .aider*
 .github/copilot-instructions.md
+
+# Screenshots and binary artifacts
+*.png

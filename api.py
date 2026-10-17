@@ -17,13 +17,13 @@ from github_analysis import (
     GitHubNotFound,
     GitHubUnavailable,
     answer_github_question,
+    format_friend_competition,
     get_contributors,
     get_issue,
     get_issues,
 )
 
 load_dotenv()
-
 
 
 def _gemini_client():
@@ -88,11 +88,32 @@ def github_contributors(repo: str = GITHUB_REPO):
 
 
 @app.get("/github/issues")
-def github_issues(repo: str = GITHUB_REPO, state: str = "open", label: str | None = None):
-    """Issues (pull requests excluded); filter with state=open|closed|all and an optional label."""
+def github_issues(repo: str = GITHUB_REPO, state: str = "open", label: str | None = None,
+                  labels: str | None = None, author: str | None = None, assignee: str | None = None,
+                  unassigned: bool = False):
+    """Issues (pull requests excluded); filter with state=open|closed|all, label(s), author, assignee, unassigned."""
+    if labels:
+        label_list = [part.strip() for part in labels.split(",") if part.strip()]
+    else:
+        label_list = [label] if label else None
     try:
         return {"status": "success", "repo": repo,
-                "data": get_issues(repo, state=state, labels=[label] if label else None)}
+                "data": get_issues(repo, state=state, labels=label_list, author=author, assignee=assignee, unassigned=unassigned)}
+    except (GitHubNotFound, GitHubUnavailable) as exc:
+        raise _github_http_error(exc) from exc
+
+
+@app.get("/github/compare")
+def github_compare(users: str, repo: str = GITHUB_REPO):
+    """Compare multiple contributors/friends for open source competition and collaboration tracking."""
+    user_list = [u.strip() for u in users.split(",") if u.strip()]
+    if len(user_list) < 2:
+        raise HTTPException(status_code=400, detail="Provide at least two comma-separated users to compare.")
+    try:
+        contributors = get_contributors(repo)
+        issues = get_issues(repo, state="all")
+        result = format_friend_competition(repo, user_list, contributors, issues)
+        return {"status": "success", "repo": repo, "users": user_list, "summary": result}
     except (GitHubNotFound, GitHubUnavailable) as exc:
         raise _github_http_error(exc) from exc
 

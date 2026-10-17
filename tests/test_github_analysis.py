@@ -24,12 +24,14 @@ def contributor(login: str, count: int) -> dict:
             "html_url": f"https://github.com/{login}", "type": "User"}
 
 
-def issue(number: int, title: str, labels: list[str] | None = None, **extra) -> dict:
+def issue(number: int, title: str, labels: list[str] | None = None,
+          author: str = "Sumit884-byte", assignees: list[str] | None = None, **extra) -> dict:
     payload = {
         "number": number,
         "title": title,
         "state": "open",
-        "user": {"login": "Sumit884-byte"},
+        "user": {"login": author, "html_url": f"https://github.com/{author}"},
+        "assignees": [{"login": name} for name in (assignees or [])],
         "created_at": "2026-10-16T10:00:00Z",
         "updated_at": "2026-10-17T09:00:00Z",
         "labels": [{"name": label} for label in (labels or [])],
@@ -218,6 +220,147 @@ class GitHubAnswerTests(unittest.TestCase):
             )
         self.assertIn("couldn't find that on GitHub for **nobody/nothing-here**", answer)
 
+    def test_quoted_label_filter(self):
+        asked = []
+
+        def fetch(path, params=None):
+            asked.append((path, params))
+            return [issue(1, "Fix kernel crash", ["Good First Issue"]),
+                    issue(2, "Refactor scheduler", ["enhancement"])]
+
+        with patch.object(github_analysis, "_http_get_json", side_effect=fetch):
+            answer = answer_github_question(
+                'what issues in vllm-project/vllm are labeled "good first issue"?'
+            )
+        self.assertEqual(asked[0][0], "/repos/vllm-project/vllm/issues")
+        self.assertIn("Fix kernel crash", answer)
+        self.assertNotIn("Refactor scheduler", answer)
+        self.assertIn("labeled `good first issue`", answer)
+
+    def test_assignee_and_author_filters(self):
+        with patch.object(github_analysis, "_http_get_json", return_value=[
+            issue(1, "Mine", assignees=["octocat"], author="riya-dev"),
+            issue(2, "Theirs", assignees=["other-user"], author="octocat"),
+        ]):
+            by_assignee = answer_github_question("what issues are assigned to @octocat?")
+            by_author = answer_github_question("what issues were opened by octocat?")
+        self.assertIn("Mine", by_assignee)
+        self.assertNotIn("Theirs", by_assignee)
+        self.assertIn("assigned to **octocat**", by_assignee)
+        self.assertIn("Theirs", by_author)
+        self.assertNotIn("Mine", by_author)
+        self.assertIn("opened by **octocat**", by_author)
+
+    def test_assigned_to_me_asks_for_a_github_username(self):
+        with patch.object(github_analysis, "_http_get_json") as fetch:
+            answer = answer_github_question("what issues are assigned to me?")
+        fetch.assert_not_called()
+        self.assertIn("GitHub username", answer)
+
+    def test_leaderboard_ranks_issue_authors_over_all_states(self):
+        asked = []
+
+        def fetch(path, params=None):
+            asked.append((path, params))
+            return [issue(1, "a", author="riya-dev"), issue(2, "b", author="riya-dev"),
+                    issue(3, "c", author="octocat")]
+
+        with patch.object(github_analysis, "_http_get_json", side_effect=fetch):
+            answer = answer_github_question("who opened the most issues in vllm-project/vllm?")
+        self.assertEqual(asked[0][1]["state"], "all")
+        self.assertIn("**riya-dev** — 2 issue(s)", answer)
+        self.assertIn("**octocat** — 1 issue(s)", answer)
+        self.assertIn("fetched window", answer)
+
+    def test_closed_state_is_passed_through(self):
+        asked = []
+
+        def fetch(path, params=None):
+            asked.append((path, params))
+            return [issue(1, "Done long ago")]
+
+        with patch.object(github_analysis, "_http_get_json", side_effect=fetch):
+            answer = answer_github_question("what closed issues are there?")
+        self.assertEqual(asked[0][1]["state"], "closed")
+        self.assertIn("closed issues", answer.casefold())
+
+    def test_url_containing_issues_with_commit_question_answers_contributors(self):
+        asked = []
+
+        def fetch(path, params=None):
+            asked.append(path)
+            return [contributor("coder1", 50), contributor("coder2", 30)]
+
+        with patch.object(github_analysis, "_http_get_json", side_effect=fetch):
+            answer = answer_github_question(
+                "https://github.com/vllm-project/vllm/issues for this repo. how many of the people have commited?"
+            )
+        self.assertEqual(asked, ["/repos/vllm-project/vllm/contributors"])
+        self.assertIn("**vllm-project/vllm** has **80** commits by **2** contributor(s)", answer)
+        self.assertIn("**coder1** — 50 commits", answer)
+
+    def test_friend_competition_comparison(self):
+        asked = []
+
+        def fetch(path, params=None):
+            asked.append(path)
+            if "contributors" in path:
+                return [contributor("alice", 25), contributor("bob", 10), contributor("charlie", 50)]
+            if "issues" in path:
+                return [
+                    issue(1, "Fix memory leak", author="alice", assignees=["alice"], state="closed"),
+                    issue(2, "Add feature", author="alice", assignees=["alice"], state="open"),
+                    issue(3, "Update docs", author="bob", assignees=["bob"], state="open"),
+                    issue(4, "Refactor engine", author="charlie", assignees=["charlie"], state="open"),
+                ]
+            return []
+
+        with patch.object(github_analysis, "_http_get_json", side_effect=fetch):
+            answer = answer_github_question("compare alice and bob in vllm-project/vllm")
+
+        self.assertIn("Open-Source Showdown in vllm-project/vllm", answer)
+        self.assertIn("**alice**", answer)
+        self.assertIn("Commits: **25** (#2 overall)", answer)
+        self.assertIn("Assigned Issues: **2** (1 completed, 1 in progress)", answer)
+        self.assertIn("**bob**", answer)
+        self.assertIn("Commits: **10** (#3 overall)", answer)
+        self.assertIn("**Leader**: **alice** leads the competition", answer)
+
+    def test_unassigned_issues_filter(self):
+        asked = []
+
+        def fetch(path, params=None):
+            asked.append((path, params))
+            return [
+                issue(1, "Assigned issue", assignees=["alice"]),
+                issue(2, "Unclaimed issue", assignees=[]),
+            ]
+
+        with patch.object(github_analysis, "_http_get_json", side_effect=fetch):
+            answer = answer_github_question("what unassigned issues are open in vllm-project/vllm?")
+
+        self.assertIn("unassigned issues in vllm-project/vllm", answer)
+        self.assertIn("Unclaimed issue", answer)
+        self.assertNotIn("Assigned issue", answer)
+
+    def test_assignee_leaderboard(self):
+        asked = []
+
+        def fetch(path, params=None):
+            asked.append((path, params))
+            return [
+                issue(1, "Task 1", assignees=["alice", "bob"]),
+                issue(2, "Task 2", assignees=["alice"]),
+                issue(3, "Task 3", assignees=["charlie"]),
+            ]
+
+        with patch.object(github_analysis, "_http_get_json", side_effect=fetch):
+            answer = answer_github_question("who has the most assigned issues in vllm-project/vllm?")
+
+        self.assertIn("Top issue assignees in vllm-project/vllm", answer)
+        self.assertIn("**alice** — 2 assigned issue(s)", answer)
+        self.assertIn("**bob** — 1 assigned issue(s)", answer)
+
 
 _original_falkordb = falkordb.FalkorDB
 _import_graph = SimpleNamespace(query=lambda *_args, **_kwargs: SimpleNamespace(result_set=[]))
@@ -262,6 +405,33 @@ class GitHubApiRouteTests(unittest.TestCase):
         with patch.object(github_analysis, "_http_get_json", side_effect=GitHubNotFound("gone")):
             response = self.client.get("/github/issue/999")
         self.assertEqual(response.status_code, 404)
+
+    def test_issues_endpoint_unassigned_filter(self):
+        with patch.object(github_analysis, "_http_get_json", return_value=[
+            issue(1, "Assigned", assignees=["alice"]),
+            issue(2, "Unassigned", assignees=[]),
+        ]):
+            response = self.client.get("/github/issues", params={"unassigned": "true"})
+        self.assertEqual(response.status_code, 200, response.text)
+        numbers = [row["number"] for row in response.json()["data"]]
+        self.assertEqual(numbers, [2])
+
+    def test_compare_endpoint_returns_showdown(self):
+        def fetch(path, params=None):
+            if "contributors" in path:
+                return [contributor("alice", 20), contributor("bob", 15)]
+            return [issue(1, "Task", author="alice", assignees=["bob"])]
+
+        with patch.object(github_analysis, "_http_get_json", side_effect=fetch):
+            response = self.client.get("/github/compare", params={"users": "alice,bob", "repo": "vllm-project/vllm"})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "success")
+        self.assertIn("Open-Source Showdown in vllm-project/vllm", body["summary"])
+
+    def test_compare_endpoint_requires_two_users(self):
+        response = self.client.get("/github/compare", params={"users": "alice"})
+        self.assertEqual(response.status_code, 400)
 
     def test_github_unavailable_maps_to_503(self):
         with patch.object(github_analysis, "_http_get_json",
