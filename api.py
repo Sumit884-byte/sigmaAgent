@@ -1442,8 +1442,86 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
     return response.parsed
 
 
+DIRECT_CREATE_TASK_RE = re.compile(
+    r"^\s*(?:create|add|new)\s+task\s+(?P<title>.+?)(?:\s+(?:for|assigned to)\s+(?P<dev>[A-Za-z0-9_ -]+))?\s*$",
+    re.IGNORECASE,
+)
+DIRECT_ASSIGN_RE = re.compile(
+    r"^\s*assign\s+(?P<task>T\d+|[A-Za-z0-9_ -]+?)\s+to\s+(?P<dev>[A-Za-z0-9_ -]+)\s*$",
+    re.IGNORECASE,
+)
+DIRECT_STATUS_RE = re.compile(
+    r"^\s*(?:mark|set\s+status\s+of)\s+(?P<task>T\d+|[A-Za-z0-9_ -]+?)\s+(?:as\s+|to\s+)?(?P<status>todo|in_progress|done)\s*$",
+    re.IGNORECASE,
+)
+DIRECT_LIST_TASKS_RE = re.compile(
+    r"^\s*(?:list\s+tasks|what\s+are\s+the\s+tasks|show\s+tasks|tasks)\s*[?!.]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _direct_task_command_answer(question, guild_id, discord):
+    """Direct, deterministic task commands that execute immediately without requiring LLM quota."""
+    if DIRECT_LIST_TASKS_RE.match(question):
+        tasks = _all_tasks(guild_id)
+        if not tasks:
+            return "There are no tasks tracked in this server's graph yet."
+        grouped = _aggregate_task_rows(tasks)
+        lines = ["**Tasks in this server:**"]
+        for tid, title, owners, status, _ in grouped:
+            owner_str = f" ({', '.join(owners)})" if owners else " (unassigned)"
+            status_str = f" [{status}]" if status and status != "todo" else ""
+            lines.append(f"- **{tid}**: {title}{owner_str}{status_str}")
+        return "\n".join(lines)
+
+    provenance = _discord_provenance(discord, guild_id, question)
+    author = (discord or {}).get("author_name") or "someone"
+
+    match = DIRECT_CREATE_TASK_RE.match(question)
+    if match:
+        title = match.group("title").strip()
+        dev = match.group("dev").strip() if match.group("dev") else None
+        change = TaskChange(action="create", title=title, developer=dev)
+        try:
+            applied_summary = _apply_change(guild_id, change, author, provenance)
+            return f"- {applied_summary}"
+        except Exception as exc:
+            return f"Couldn't create task: {exc}"
+
+    match = DIRECT_ASSIGN_RE.match(question)
+    if match:
+        task_ref = match.group("task").strip()
+        dev = match.group("dev").strip()
+        task_id = _resolve_task_reference(guild_id, task_ref)
+        if not task_id:
+            return f"I couldn't find a task matching '{task_ref}'."
+        change = TaskChange(action="assign", task_id=task_id, developer=dev)
+        try:
+            applied_summary = _apply_change(guild_id, change, author, provenance)
+            return f"- {applied_summary}"
+        except Exception as exc:
+            return f"Couldn't assign task: {exc}"
+
+    match = DIRECT_STATUS_RE.match(question)
+    if match:
+        task_ref = match.group("task").strip()
+        status_val = match.group("status").strip().lower().replace(" ", "_")
+        task_id = _resolve_task_reference(guild_id, task_ref)
+        if not task_id:
+            return f"I couldn't find a task matching '{task_ref}'."
+        change = TaskChange(action="set_status", task_id=task_id, status=status_val)
+        try:
+            applied_summary = _apply_change(guild_id, change, author, provenance)
+            return f"- {applied_summary}"
+        except Exception as exc:
+            return f"Couldn't update status: {exc}"
+
+    return None
+
+
 @app.post("/investigate")
 def investigate(req: InvestigateRequest):
+
     discord = req.discord or {}
     if HELP_RE.match(req.question):
         return {"answer": HELP_TEXT}
@@ -1478,6 +1556,9 @@ def investigate(req: InvestigateRequest):
     ownership_answer = _ownership_provenance_answer(req.question, guild_id, tasks)
     if ownership_answer is not None:
         return {"answer": ownership_answer}
+    task_command_answer = _direct_task_command_answer(req.question, guild_id, discord)
+    if task_command_answer is not None:
+        return {"answer": task_command_answer}
     gemini = _gemini_client()
     if gemini:
         try:
