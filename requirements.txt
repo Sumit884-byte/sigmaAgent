@@ -3,3 +3,4 @@ uvicorn
 falkordb
 python-dotenv
 google-genai
+httpx
