@@ -197,13 +197,54 @@ class AgentReply(BaseModel):
     changes: list[TaskChange]
 
 
+# Everything SigmaAgent can do, in one place: the `help` reply, the fallback answer and the
+# Gemini prompt are all built from this, so the bot always describes itself accurately.
+CAPABILITIES = [
+    ("Tasks and dependencies", [
+        ("what is blocked?", "blocked tasks and what they wait on"),
+        ("what is Person 2 working on?", "someone's tasks and who waits on them"),
+        ("Priya will do the frontend", "plain-language updates create, assign, block, finish, rename or delete tasks"),
+        ("why is T2 assigned to Priya?", "who made a change, when, with a link to their message"),
+    ]),
+    ("Graph analysis (instant, shows the Cypher)", [
+        ("explain T5", "dependency chain with owners and who assigned them"),
+        ("impact Backend", "everything that slips if a task slips"),
+        ("bottlenecks", "tasks and people others wait on most (PageRank)"),
+    ]),
+    ("Who knows what", [
+        ("who knows about billing?", "people ranked by evidence: tasks, teams, commits, issues, docs, chat"),
+        ("experts", "topics and their top people"),
+        ("teams", "teams and members; say `Priya joined the payments team` to update"),
+        ("Naseem77 is Person 1 on github", "link a GitHub account to a person"),
+    ]),
+    ("GitHub and docs", [
+        ("sync github owner/repo", "pull commits, issues/PRs and Markdown docs into this server's graph"),
+        ("who are the contributors?", "commit counts per person"),
+        ("what bugs are open?", "open issues, by label, author or assignee"),
+        ("summarize issue #6", "an issue's summary and latest discussion"),
+    ]),
+]
+
+
+def _render_capabilities(markdown=True):
+    lines = []
+    for section, items in CAPABILITIES:
+        lines.append(f"**{section}**" if markdown else f"{section}:")
+        lines += [f"- `{example}`: {description}" if markdown else f"- '{example}': {description}"
+                  for example, description in items]
+    return "\n".join(lines)
+
+
 HELP_TEXT = (
-    "I answer questions about the team's task graph. Try:\n"
-    "- `what is blocked?` / `why is X delayed?`\n"
-    "- `what is <developer> working on?`\n"
-    "- `list tasks`\n"
-    "- `impact T3` / `bottlenecks` / `explain T5` (shows the graph query)\n"
-    "- `who knows about billing?` / `experts` / `teams` / `sync github owner/repo`"
+    "I'm **SigmaAgent**, this server's project brain. Mention me with a question or an update:\n\n"
+    + _render_capabilities()
+    + "\n\nAnything else, just ask: I answer from this server's tasks, chat history, docs and GitHub "
+    "and link my sources. Each server has its own graph."
+)
+HELP_RE = re.compile(
+    r"^\s*(?:help|commands|capabilities|what\s+(?:can|do)\s+you\s+do|what\s+are\s+you|who\s+are\s+you|"
+    r"how\s+do\s+i\s+use\s+you|what\s+can\s+i\s+ask(?:\s+you)?|what\s+do\s+you\s+know)\s*[?.!]*\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -1229,6 +1270,9 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
     ) or "(no related messages)"
     prompt = (
         "You are SigmaAgent, a project assistant in the team's Discord. "
+        "Your capabilities are listed here; when someone asks what you can do or how to do something, answer from this "
+        "list and quote the exact command to type (never claim abilities that aren't listed):\n"
+        f"{_render_capabilities(markdown=False)}\n\n"
         "Answer the question using only the task graph and channel messages below. If the answer isn't in them, say so. "
         "The task graph is the source of truth for owners and blockers; use the messages for extra context "
         "and link to a message when you rely on it, as [date](link). "
@@ -1291,6 +1335,8 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
 @app.post("/investigate")
 def investigate(req: InvestigateRequest):
     discord = req.discord or {}
+    if HELP_RE.match(req.question):
+        return {"answer": HELP_TEXT}
     # Requests from outside Discord (e.g. curl) use the default server
     server_id = discord.get("guild_id") if req.discord else os.getenv("DISCORD_GUILD_ID")
     if server_id:
