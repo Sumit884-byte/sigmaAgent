@@ -155,9 +155,9 @@ def extract_repo(question: str) -> str | None:
         if is_safe_repo(candidate):
             return candidate
 
-    # Look for explicit repo: owner/repo, repository owner/repo, in/for/to owner/repo
+    # Look for explicit repo: "repo owner/name" or "repository owner/name"
     explicit_match = re.search(
-        r"(?:repo|repository|in|for|to)\s*[:=]?\s*([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_][A-Za-z0-9_.-]{0,99})\b",
+        r"\b(?:repo|repository)\s*[:=]?\s*([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_][A-Za-z0-9_.-]{0,99})\b",
         question or "",
         re.IGNORECASE,
     )
@@ -165,6 +165,26 @@ def extract_repo(question: str) -> str | None:
         candidate = f"{explicit_match.group(1)}/{explicit_match.group(2).rstrip('.,;:!?)]}')}"
         if is_safe_repo(candidate):
             return candidate
+
+    # Bare owner/repo anywhere in the question (e.g. "contributors to barchart/marketdata-api-js")
+    # Only accept this as a repo if the rest of the question also mentions GitHub
+    # ("github", "gh", "contributors", "compare", "issues" …) — not just task words
+    # like "bug" or "issue", which would turn ordinary task messages into false repo references.
+    bare_match = re.search(
+        r"\b([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_][A-Za-z0-9_.-]{0,99})\b",
+        question or "",
+    )
+    if bare_match:
+        candidate = f"{bare_match.group(1)}/{bare_match.group(2).rstrip('.,;:!?)]}')}"
+        if is_safe_repo(candidate):
+            # Reject purely numeric "N/N" like "24/7" (uptime, not a repo reference)
+            owner, name = candidate.split("/", 1)
+            if owner.isdigit() and name.isdigit():
+                pass
+            else:
+                rest = (question or "").replace(candidate, "")
+                if re.search(r"\b(?:github|gh|contribut\w*|issues|compare)\b", rest, re.IGNORECASE):
+                    return candidate
 
     return None
 
@@ -217,51 +237,65 @@ def get_issues(repo: str = DEFAULT_REPO, state: str = "open",
     """
     if state not in {"open", "closed", "all"}:
         state = "open"
-    params: dict[str, str] = {"state": state, "per_page": "100", "sort": "updated", "direction": "desc"}
-    if labels:
-        params["labels"] = ",".join(labels)
-    if author:
-        params["creator"] = author.lstrip("@")
-    if assignee:
-        params["assignee"] = assignee.lstrip("@")
 
-    items = gh_get(_repo_path(repo, "/issues"), params)
-    wanted = {label.casefold() for label in labels} if labels else None
-    author_id = (author or "").casefold().lstrip("@")
-    assignee_id = (assignee or "").casefold().lstrip("@")
-    issues = []
-    for item in items:
-        if not isinstance(item, dict) or "pull_request" in item:
-            continue
-        item_author = (item.get("user") or {}).get("login") or ""
-        item_assignees = [
-            (entry or {}).get("login") or ""
-            for entry in item.get("assignees", [])
-            if isinstance(entry, dict)
-        ]
-        if unassigned and item_assignees:
-            continue
-        if author_id and item_author.casefold() != author_id:
-            continue
-        if assignee_id and assignee_id not in {name.casefold() for name in item_assignees}:
-            continue
-        label_names = _issue_labels(item)
-        if wanted and not (wanted & {name.casefold() for name in label_names}):
-            continue
-        issues.append({
-            "number": item.get("number"),
-            "title": item.get("title") or "",
-            "state": item.get("state") or "open",
-            "author": item_author or "unknown",
-            "author_url": (item.get("user") or {}).get("html_url") or "",
-            "assignees": [name for name in item_assignees if name],
-            "created_at": item.get("created_at"),
-            "updated_at": item.get("updated_at"),
-            "labels": label_names,
-            "comments": int(item.get("comments") or 0),
-            "url": item.get("html_url") or "",
-        })
-    return issues
+    def _fetch(label_list: list[str] | None) -> list[dict[str, Any]]:
+        params: dict[str, str] = {"state": state, "per_page": "100", "sort": "updated", "direction": "desc"}
+        if label_list:
+            params["labels"] = label_list[0]
+        if author:
+            params["creator"] = author.lstrip("@")
+        if assignee:
+            params["assignee"] = assignee.lstrip("@")
+
+        items = gh_get(_repo_path(repo, "/issues"), params)
+        wanted = {label.casefold() for label in label_list} if label_list else None
+        author_id = (author or "").casefold().lstrip("@")
+        assignee_id = (assignee or "").casefold().lstrip("@")
+        out = []
+        for item in items:
+            if not isinstance(item, dict) or "pull_request" in item:
+                continue
+            item_author = (item.get("user") or {}).get("login") or ""
+            item_assignees = [
+                (entry or {}).get("login") or ""
+                for entry in item.get("assignees", [])
+                if isinstance(entry, dict)
+            ]
+            if unassigned and item_assignees:
+                continue
+            if author_id and item_author.casefold() != author_id:
+                continue
+            if assignee_id and assignee_id not in {name.casefold() for name in item_assignees}:
+                continue
+            label_names = _issue_labels(item)
+            if wanted and not (wanted & {name.casefold() for name in label_names}):
+                continue
+            out.append({
+                "number": item.get("number"),
+                "title": item.get("title") or "",
+                "state": item.get("state") or "open",
+                "author": item_author or "unknown",
+                "author_url": (item.get("user") or {}).get("html_url") or "",
+                "assignees": [name for name in item_assignees if name],
+                "created_at": item.get("created_at"),
+                "updated_at": item.get("updated_at"),
+                "labels": label_names,
+                "comments": int(item.get("comments") or 0),
+                "url": item.get("html_url") or "",
+            })
+        return out
+
+    # GitHub treats comma-separated labels as AND (must have ALL). To get OR
+    # semantics (bug OR documentation), send one request per label and merge,
+    # deduplicating by issue number.
+    if labels and len(labels) > 1:
+        merged: dict[int, dict[str, Any]] = {}
+        for label in labels:
+            for issue in _fetch([label]):
+                merged[issue["number"]] = issue
+        return list(merged.values())
+
+    return _fetch(labels)
 
 
 def get_issue(repo: str, number: int) -> dict[str, Any]:
@@ -622,12 +656,17 @@ TASK_COMMAND_PATTERN = re.compile(
     re.IGNORECASE,
 )
 EXPLICIT_GITHUB_TRIGGER = re.compile(
-    r"(?:https?://github\.com/\S+|\bgithub\b|\bgh\b|\b(?:in|on|for|from)\s+github\b|\brepo:\s*[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+|\b(?:in|for|to)\s+repo\s+[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+)",
+    r"(?:https?://github\.com/\S+|\bgithub\.com\b|\bgithub\b|\bgh\b|\b(?:in|on|for|from)\s+github\b|\brepo:\s*[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+|\b(?:in|for|to)\s+repo\s+[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+)",
+    re.IGNORECASE,
+)
+# Explicit "github help" / "gh help" request — the only case where the help text is shown.
+GITHUB_HELP_REQUEST = re.compile(
+    r"\b(?:github|gh)\s+help\b|\bhelp\s+(?:with\s+)?github\b",
     re.IGNORECASE,
 )
 GITHUB_QUERY_INTENT = re.compile(
     r"\b(?:who\s+are\s+the\s+contributors|who\s+committed|who\s+contributed|how\s+many\s+(?:of\s+the\s+people\s+have\s+)?committ?ed|contributor\s+list)\b|"
-    r"\b(?:what|show|list|find|get)\s+(?:are\s+the\s+)?(?:all\s+)?(?:open\s+|closed\s+|unassigned\s+)?(?:issues|bugs|tickets)\b|"
+    r"\b(?:what|show|list|find|get)\s+(?:are\s+the\s+)?(?:all\s+)?(?:open\s+|closed\s+|unassigned\s+)?(?:issues|bugs|tickets)(?!\s+(?:are\s+)?blocking\b)\b|"
     r"\b(?:what\s+bugs\s+are\s+open|open\s+bugs\b|closed\s+issues\b|unassigned\s+issues\b|unclaimed\s+issues\b)"
     r"|\b(?:issues|bugs)\s+labeled\b"
     r"|\bissues\s+assigned\s+to\b"
@@ -649,12 +688,21 @@ def answer_github_question(question: str, repo: str | None = None) -> str | None
     if TASK_COMMAND_PATTERN.search(question):
         return None
 
+    # 3. Messages that reference a task ID (T1, T5 …) but no explicit GitHub trigger
+    #    are task-bot questions (e.g. "what issues are blocking T5?") — never intercept them.
+    has_task_id = bool(re.search(r"\bT\d+\b", question, re.IGNORECASE))
+
     extracted_repo = extract_repo(question)
     has_explicit_trigger = bool(
         extracted_repo
         or EXPLICIT_GITHUB_TRIGGER.search(question)
         or re.search(r"\b(?:to|in)\s+the\s+repo\b", question, re.IGNORECASE)
     )
+
+    # If the message mentions a task ID without an explicit GitHub URL/keyword,
+    # hand it back to the task flow.
+    if has_task_id and not has_explicit_trigger:
+        return None
 
     # 2. If repo was not explicitly passed in by the caller, require an explicit trigger or recognized GitHub intent
     if repo is None and not has_explicit_trigger:
@@ -754,7 +802,8 @@ def answer_github_question(question: str, repo: str | None = None) -> str | None
         if wants_commits or "commit" in prose_lowered or "contribut" in prose_lowered:
             return format_contributors(target_repo, get_contributors(target_repo))
 
-        if has_explicit_trigger:
+        # Only show GitHub help when the user explicitly asked for it.
+        if GITHUB_HELP_REQUEST.search(question) and has_explicit_trigger:
             return GITHUB_HELP_TEXT.format(repo=target_repo)
 
         return None

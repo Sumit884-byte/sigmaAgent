@@ -126,6 +126,49 @@ class GitHubAnswerTests(unittest.TestCase):
             with self.subTest(question=question):
                 self.assertIsNone(answer_github_question(question), question)
 
+    def test_word_inside_slash_not_treated_as_repo(self):
+        """Words like 'platform/web' or 'design/mockups' must not be extracted as repos."""
+        for question in (
+            "the platform/web task is late",
+            "T5 is waiting for design/mockups from Alice",
+        ):
+            with self.subTest(question=question):
+                self.assertIsNone(extract_repo(question), question)
+
+    def test_github_mention_in_task_message_returns_none(self):
+        """A task message that mentions 'GitHub' but is a task command should not get help text."""
+        for question in (
+            "Add GitHub Actions deployment task for Bob",
+            "create a task for GitHub CI/CD pipeline setup",
+        ):
+            with self.subTest(question=question):
+                result = answer_github_question(question, self.repo)
+                self.assertIsNone(result, f"should not answer task message: {question!r}")
+
+    def test_task_id_question_without_github_trigger_returns_none(self):
+        """'what issues are blocking T5?' must not be claimed as a GitHub query."""
+        for question in (
+            "what issues are blocking T5?",
+            "what issues does T3 depend on?",
+            "show bugs related to T2",
+        ):
+            with self.subTest(question=question):
+                result = answer_github_question(question, self.repo)
+                self.assertIsNone(result, f"task-ID question should not be intercepted: {question!r}")
+
+    def test_multi_label_uses_or_not_and(self):
+        """'list open bugs in the docs' should show issues with bug OR documentation, not only both."""
+        with patch.object(github_analysis, "_http_get_json", return_value=[
+            issue(1, "Crash on login", ["bug"]),
+            issue(2, "Missing API guide", ["documentation"]),
+            issue(3, "Unrelated feature", ["enhancement"]),
+        ]):
+            answer = answer_github_question("list open bugs in the docs on github", self.repo)
+        self.assertIsNotNone(answer)
+        self.assertIn("Crash on login", answer)
+        self.assertIn("Missing API guide", answer)
+        self.assertNotIn("Unrelated feature", answer)
+
     def test_contributors_and_commit_counts(self):
         with patch.object(github_analysis, "_http_get_json",
                           return_value=[contributor("Sumit884-byte", 34), contributor("riya-dev", 21)]):
@@ -200,10 +243,16 @@ class GitHubAnswerTests(unittest.TestCase):
         self.assertIn("Nothing was changed", answer)
 
     def test_github_hint_without_action_shows_help(self):
+        """'github help' shows the help text; generic 'tell me about the github' does not."""
         with patch.object(github_analysis, "_http_get_json") as fetch:
-            answer = answer_github_question("tell me about the github", self.repo)
-        self.assertIn("who are the contributors?", answer)
-        self.assertIn("summarize issue #6", answer)
+            # Explicit help request should show help
+            help_answer = answer_github_question("github help", self.repo)
+            # Generic mention of "github" without a specific action should NOT show help
+            generic_answer = answer_github_question("tell me about the github", self.repo)
+        self.assertIsNotNone(help_answer)
+        self.assertIn("who are the contributors?", help_answer)
+        self.assertIn("summarize issue #6", help_answer)
+        self.assertIsNone(generic_answer)
         fetch.assert_not_called()
 
     def test_repeated_answers_use_the_cache(self):
