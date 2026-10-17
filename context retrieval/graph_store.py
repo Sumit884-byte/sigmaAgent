@@ -27,7 +27,8 @@ _GRAPH_CACHE: dict[tuple[str, int, str | None, str | None, str], Any] = {}
 _GRAPH_CACHE_LOCK = threading.Lock()
 
 
-def connect_graph() -> Any:
+def connect_graph(guild_id: str | None = None) -> Any:
+    """Connect to a Discord server's own graph when FALKORDB_GRAPH_PREFIX is set, else FALKORDB_GRAPH."""
     options: dict[str, Any] = {
         "host": os.getenv("FALKORDB_HOST", "127.0.0.1"),
         "port": int(os.getenv("FALKORDB_PORT", "6379")),
@@ -39,6 +40,11 @@ def connect_graph() -> Any:
     if password:
         options["password"] = password
     graph_name = os.getenv("FALKORDB_GRAPH", "SigmaPerson3Test")
+    prefix = os.getenv("FALKORDB_GRAPH_PREFIX")
+    if prefix and guild_id:
+        if not re.fullmatch(r"[0-9]{17,20}", str(guild_id)):
+            raise ValueError("guild_id must be a Discord snowflake")
+        graph_name = f"{prefix}{guild_id}"
     key = (options["host"], options["port"], username, password, graph_name)
     with _GRAPH_CACHE_LOCK:
         if key not in _GRAPH_CACHE:
