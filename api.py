@@ -13,6 +13,7 @@ from google import genai
 from google.genai import errors as genai_errors
 from pydantic import BaseModel
 
+import arka_llm
 import knowledge
 from github_analysis import (
     GitHubNotFound,
@@ -28,12 +29,21 @@ load_dotenv()
 
 
 def _gemini_client():
-    # Re-read .env so a newly added key works without restarting the server
+    """The configured language model: Arka over MCP (LLM_PROVIDER=arka) or Gemini, or None."""
+    # Re-read .env so a newly added key or provider works without restarting the server
     load_dotenv(override=True)
+    if os.getenv("LLM_PROVIDER", "").strip().casefold() == "arka":
+        return arka_llm.shared_llm()
     key = os.getenv("GEMINI_API_KEY")
     return genai.Client(api_key=key) if key else None
 
 app = FastAPI(title="Sigma Agent API")
+
+
+@app.on_event("startup")
+def _warm_up_language_model():
+    if os.getenv("LLM_PROVIDER", "").strip().casefold() == "arka":
+        arka_llm.warm_up()
 
 # 1. Database Credentials
 CLOUD_HOST = os.getenv("FALKORDB_HOST", "r-6jissuruar.instance-gijzjhvh6.hc-7up0crkyn.ap-south-1.aws.f2e0a955bb84.cloud")
@@ -195,6 +205,15 @@ class TaskChange(BaseModel):
 class AgentReply(BaseModel):
     answer: str
     changes: list[TaskChange]
+
+
+AGENT_REPLY_FORMAT = (
+    '{"answer": "<reply to the user>", "changes": [{"action": "<create|assign|unassign|block|unblock|set_status|'
+    'rename|delete|join_team|leave_team|link_github>", "task_id": "<T1 or null>", "title": "<or null>", '
+    '"developer": "<or null>", "blocked_by": "<task ID or null>", "status": "<todo|in_progress|done or null>", '
+    '"inferred": <true|false|null>, "team": "<or null>", "github_login": "<or null>"}]}\n'
+    'Use "changes": [] when nothing should change; omit fields that do not apply.'
+)
 
 
 # Everything SigmaAgent can do, in one place: the `help` reply, the fallback answer and the
@@ -1284,8 +1303,11 @@ def _answer_after_changes(gemini, question, guild_id, applied):
         "(don't repeat the changes). Use **bold** for people and task names; no code blocks or backticks. "
         f"If the message has no question, reply with exactly NONE.\n\nMessage: {question}"
     )
-    config = genai.types.GenerateContentConfig(thinking_config=genai.types.ThinkingConfig(thinking_budget=0))
-    text = (_generate_with_fallback(gemini, prompt, config).text or "").strip()
+    if isinstance(gemini, arka_llm.ArkaLLM):
+        text = gemini.complete(prompt)
+    else:
+        config = genai.types.GenerateContentConfig(thinking_config=genai.types.ThinkingConfig(thinking_budget=0))
+        text = (_generate_with_fallback(gemini, prompt, config).text or "").strip()
     return None if text.upper().startswith("NONE") else text
 
 
@@ -1353,7 +1375,10 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
         "If the messages say who is doing what but that isn't in the task graph yet, answer from the messages, "
         "say it isn't tracked as a task yet, and suggest the user ask you to add it.\n\n"
         f"Recent and related messages from this channel (oldest first):\n{history}\n\n"
-        f"Message from {author}: {question}"
+        f"Message from {author}: {question}\n\n"
+        "Reminder: you can only do what your capability list says. You cannot send emails or messages, schedule "
+        "meetings, set reminders, browse the web or write code; if asked to, say plainly that you can't and suggest "
+        "the closest thing you can do."
     )
     # Thinking adds several seconds per reply and isn't needed for lookups this small
     config = genai.types.GenerateContentConfig(
@@ -1361,6 +1386,8 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
         response_mime_type="application/json",
         response_schema=AgentReply,
     )
+    if isinstance(gemini, arka_llm.ArkaLLM):
+        return gemini.structured(prompt, AgentReply, AGENT_REPLY_FORMAT)
     response = _generate_with_fallback(gemini, prompt, config)
     return response.parsed
 
@@ -1411,6 +1438,10 @@ def investigate(req: InvestigateRequest):
             return {"answer": "Gemini is out of free quota or overloaded on every model I can use, "
                               "so I can't answer properly right now; nothing was changed. "
                               "Try again later, or add billing to the Gemini key for higher limits."}
+        except arka_llm.ArkaUnavailable as exc:
+            print(f"Arka unavailable: {exc}")
+            return {"answer": "I couldn't reach my language model (Arka) just now, so nothing was changed. "
+                              "Check that `arka mcp serve` works on the backend machine and try again."}
         except Exception as exc:
             print(f"Gemini request failed, using rule-based answer: {exc}")
         else:
