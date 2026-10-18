@@ -107,8 +107,8 @@ def mentioned_tasks(text: str, tasks: list[tuple[str, str]]) -> list[str]:
     """Task IDs referenced in text by ID (e.g. T3, ENG-123, PROJ-42) or by their full title."""
     found = set()
     ids_map = {task_id.upper(): task_id for task_id, _ in tasks}
-    # Match standard patterns like T12, ENG-123, PROJ-456, etc.
-    for match in re.findall(r"\b[A-Za-z]+-\d+\b|\bT\d+\b", text or "", flags=re.IGNORECASE):
+    # Match standard patterns like T12, ENG-123, AB2-12, PROJ-456, etc.
+    for match in re.findall(r"\b[A-Za-z][A-Za-z0-9]*-\d+\b|\bT\d+\b", text or "", flags=re.IGNORECASE):
         if match.upper() in ids_map:
             found.add(ids_map[match.upper()])
     # Also directly check if any task ID in tasks is explicitly mentioned with token boundaries

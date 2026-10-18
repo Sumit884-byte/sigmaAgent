@@ -507,6 +507,21 @@ class GitHubApiRouteTests(unittest.TestCase):
             response = self.client.get("/github/contributors")
         self.assertEqual(response.status_code, 503)
 
+    def test_extract_compare_users_handles_kebab_case_and_rejects_task_ids(self):
+        # GitHub username like dev-123 should be recognized as a user
+        users = github_analysis.extract_compare_users("compare dev-123 and alice")
+        self.assertEqual(users, ["dev-123", "alice"])
+
+        # Jira keys with uppercase prefix and digits or tasks like T1 should NOT be recognized as users
+        users_jira = github_analysis.extract_compare_users("compare ENG-123 and alice")
+        self.assertEqual(users_jira, [])
+
+        users_jira2 = github_analysis.extract_compare_users("compare AB2-12 and alice")
+        self.assertEqual(users_jira2, [])
+
+        users_task = github_analysis.extract_compare_users("compare T1 and T2")
+        self.assertEqual(users_task, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import unittest
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -201,7 +202,7 @@ class ApiWebhookEndpointTests(unittest.TestCase):
         self.client = TestClient(app)
         self.mock_graph = MockGraph()
 
-    @patch.dict(os.environ, {"ALLOW_INSECURE_WEBHOOKS": "true"})
+    @patch.dict(os.environ, {"ALLOW_INSECURE_WEBHOOKS": "true", "DISCORD_GUILD_ID": "123456789"})
     @patch("api.tenant_graph")
     def test_webhook_endpoint_success(self, mock_tenant_graph):
         """A correctly formed webhook request is accepted and processed (dev flag bypasses HMAC)."""
@@ -481,10 +482,120 @@ class DiscordAndGCApiTests(unittest.TestCase):
         self.assertTrue(len(del_queries) > 0)
 
     def test_mentioned_tasks_matches_jira_style_keys(self):
-        tasks = [("ENG-123", "Setup infrastructure"), ("T1", "Auth API")]
-        found = knowledge.mentioned_tasks("Fixes ENG-123 and T1 in PR", tasks)
+        tasks = [("ENG-123", "Setup infrastructure"), ("T1", "Auth API"), ("AB2-12", "Billing fix")]
+        found = knowledge.mentioned_tasks("Fixes ENG-123, AB2-12 and T1 in PR", tasks)
         self.assertIn("ENG-123", found)
+        self.assertIn("AB2-12", found)
         self.assertIn("T1", found)
+
+
+class ContextRetrievalPipelineTests(unittest.TestCase):
+    def test_import_messages_is_loaded(self):
+        """Evidence pipeline must be successfully imported and ready at startup."""
+        self.assertIsNotNone(continuous_sync.DiscordMessage, "DiscordMessage should not be None")
+        self.assertIsNotNone(continuous_sync.import_messages, "import_messages should not be None")
+        self.assertTrue(callable(continuous_sync.import_messages))
+
+
+def _is_falkordb_available() -> bool:
+    host = os.getenv("FALKORDB_HOST", "127.0.0.1")
+    port = int(os.getenv("FALKORDB_PORT", "6379"))
+    username = os.getenv("FALKORDB_USERNAME") or None
+    password = os.getenv("FALKORDB_PASSWORD") or None
+    try:
+        client = falkordb.FalkorDB(host=host, port=port, username=username, password=password)
+        client.connection.ping()
+        return True
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(_is_falkordb_available(), "Real FalkorDB instance not available")
+class FalkorDbRealIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        host = os.getenv("FALKORDB_HOST", "127.0.0.1")
+        port = int(os.getenv("FALKORDB_PORT", "6379"))
+        username = os.getenv("FALKORDB_USERNAME") or None
+        password = os.getenv("FALKORDB_PASSWORD") or None
+        self.client = falkordb.FalkorDB(host=host, port=port, username=username, password=password)
+        self.graph_name = f"TestRealSync_{uuid.uuid4().hex[:10]}"
+        self.graph = self.client.select_graph(self.graph_name)
+
+    def tearDown(self):
+        try:
+            self.graph.delete()
+        except Exception:
+            pass
+
+    def test_real_falkordb_prune_graph_garbage(self):
+        """Execute real Cypher queries in prune_graph_garbage against a live FalkorDB."""
+        self.graph.query("CREATE (:DocSection {name: 'orphan_sec'})")
+        self.graph.query("CREATE (:File {name: 'orphan_file.py'})")
+        self.graph.query("CREATE (:Topic {name: 'orphan_topic'})")
+        self.graph.query(
+            "CREATE (m:DiscordMessage {id: 'del_1', is_deleted: true})-[:SUPPORTS]->(:ContextEvidence {id: 'ev_del_1'})"
+        )
+        self.graph.query(
+            "CREATE (m:DiscordMessage {id: 'exp_1', timestamp: '2020-01-01T00:00:00+00:00'})-[:SUPPORTS]->(:ContextEvidence {id: 'ev_exp_1'})"
+        )
+        self.graph.query("CREATE (:ContextEvidence {id: 'orphan_ev_alone'})")
+
+        stats = prune_graph_garbage(
+            self.graph,
+            prune_orphan_docsections=True,
+            prune_orphan_files=True,
+            prune_orphan_topics=True,
+            prune_deleted_messages=True,
+            max_message_age_days=30,
+        )
+
+        self.assertGreaterEqual(stats["pruned_doc_sections"], 1)
+        self.assertGreaterEqual(stats["pruned_files"], 1)
+        self.assertGreaterEqual(stats["pruned_topics"], 1)
+        self.assertGreaterEqual(stats["pruned_deleted_messages"], 1)
+        self.assertGreaterEqual(stats["pruned_expired_messages"], 1)
+        self.assertGreaterEqual(stats["pruned_orphan_evidence"], 1)
+        self.assertGreaterEqual(stats["total_pruned"], 6)
+
+        # Verify orphan nodes no longer exist
+        res = self.graph.query("MATCH (s:DocSection) RETURN count(s)")
+        self.assertEqual(res.result_set[0][0], 0)
+        res = self.graph.query("MATCH (f:File) RETURN count(f)")
+        self.assertEqual(res.result_set[0][0], 0)
+        res = self.graph.query("MATCH (t:Topic) RETURN count(t)")
+        self.assertEqual(res.result_set[0][0], 0)
+        res = self.graph.query("MATCH (e:ContextEvidence) RETURN count(e)")
+        self.assertEqual(res.result_set[0][0], 0)
+
+    def test_real_falkordb_stream_path(self):
+        """Execute stream_discord_message against a live FalkorDB and verify evidence pipeline."""
+        self.graph.query("CREATE (:Task {id: 'T1', title: 'Auth Pipeline'})")
+
+        result = handle_discord_stream_message(
+            self.graph,
+            {
+                "guild_id": "12345",
+                "channel_id": "chan-real",
+                "message_id": "msg-real-100",
+                "author_id": "dev-real",
+                "author_name": "Alice",
+                "content": "T1 is blocked by the missing API key.",
+            },
+        )
+        self.assertEqual(result["status"], "streamed")
+        self.assertEqual(result["message_id"], "msg-real-100")
+
+        # Verify DiscordMessage node exists
+        res = self.graph.query("MATCH (m:DiscordMessage {id: 'msg-real-100'}) RETURN m.content")
+        self.assertTrue(len(res.result_set) > 0)
+        self.assertEqual(res.result_set[0][0], "T1 is blocked by the missing API key.")
+
+        # Verify ContextEvidence was created and linked to Task T1 via [:ABOUT]
+        res_ev = self.graph.query(
+            "MATCH (m:DiscordMessage {id: 'msg-real-100'})-[:SUPPORTS]->(e:ContextEvidence)-[:ABOUT]->(t:Task {id: 'T1'}) RETURN e.kind"
+        )
+        self.assertTrue(len(res_ev.result_set) > 0)
+        self.assertEqual(res_ev.result_set[0][0], "blocker_candidate")
 
 
 if __name__ == "__main__":

@@ -23,37 +23,25 @@ import knowledge
 from github_analysis import GitHubNotFound, GitHubUnavailable, is_safe_repo
 
 
-def _load_context_retrieval_module(name: str, relative_path: str):
-    """Load a module from context retrieval/ by file path without touching sys.path.
+import sys
 
-    This prevents 'context retrieval/api.py' from shadowing the root 'api.py'
-    when continuous_sync is imported before api in a test environment.
-    """
-    cr_dir = Path(__file__).resolve().parent / "context retrieval"
-    module_path = cr_dir / relative_path
-    if not module_path.exists():
-        raise ImportError(f"context retrieval module not found: {module_path}")
-    spec = importlib.util.spec_from_file_location(f"_cr_{name}", module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot create spec for {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
-    return module
-
+_root_dir = str(Path(__file__).resolve().parent)
+_cr_dir = str(Path(__file__).resolve().parent / "context retrieval")
+if _root_dir not in sys.path:
+    sys.path.insert(0, _root_dir)
+if _cr_dir not in sys.path:
+    sys.path.append(_cr_dir)
 
 try:
-    _models_mod = _load_context_retrieval_module("models", "models.py")
-    _graph_store_mod = _load_context_retrieval_module("graph_store", "graph_store.py")
+    import models as _models_mod
+    import evidence as _evidence_mod
+    import graph_store as _graph_store_mod
     DiscordMessage = _models_mod.DiscordMessage
     import_messages = _graph_store_mod.import_messages
-except ImportError as _cr_import_err:
-    import warnings
-    warnings.warn(
-        f"context retrieval pipeline unavailable — evidence extraction disabled: {_cr_import_err}",
-        stacklevel=1,
-    )
-    DiscordMessage = None  # type: ignore
-    import_messages = None  # type: ignore
+except Exception as _cr_err:
+    raise RuntimeError(
+        f"Context retrieval evidence pipeline failed to load: {_cr_err}"
+    ) from _cr_err
 
 log = logging.getLogger("continuous_sync")
 
@@ -470,7 +458,7 @@ def prune_graph_garbage(
     if prune_orphan_docsections:
         res = graph.query(
             "MATCH (sec:DocSection) WHERE NOT ()-[:HAS_SECTION]->(sec) "
-            "WITH count(sec) AS cnt DELETE sec RETURN cnt"
+            "WITH collect(sec) AS xs FOREACH (x IN xs | DETACH DELETE x) RETURN size(xs)"
         )
         stats["pruned_doc_sections"] = res.result_set[0][0] if res.result_set else 0
 
@@ -478,7 +466,7 @@ def prune_graph_garbage(
     if prune_orphan_files:
         res = graph.query(
             "MATCH (f:File) WHERE NOT ()-[:TOUCHES]->(f) "
-            "WITH count(f) AS cnt DELETE f RETURN cnt"
+            "WITH collect(f) AS xs FOREACH (x IN xs | DETACH DELETE x) RETURN size(xs)"
         )
         stats["pruned_files"] = res.result_set[0][0] if res.result_set else 0
 
@@ -486,7 +474,7 @@ def prune_graph_garbage(
     if prune_orphan_topics:
         res = graph.query(
             "MATCH (top:Topic) WHERE NOT ()-[:EXPERT_IN]->(top) "
-            "WITH count(top) AS cnt DELETE top RETURN cnt"
+            "WITH collect(top) AS xs FOREACH (x IN xs | DETACH DELETE x) RETURN size(xs)"
         )
         stats["pruned_topics"] = res.result_set[0][0] if res.result_set else 0
 
@@ -528,7 +516,7 @@ def prune_graph_garbage(
     # 6. Orphan evidence — runs AFTER expiry so no evidence text lingers
     res_oe = graph.query(
         "MATCH (e:ContextEvidence) WHERE NOT ()-[:SUPPORTS]->(e) "
-        "WITH count(e) AS cnt DETACH DELETE e RETURN cnt"
+        "WITH collect(e) AS xs FOREACH (x IN xs | DETACH DELETE x) RETURN size(xs)"
     )
     stats["pruned_orphan_evidence"] = res_oe.result_set[0][0] if res_oe.result_set else 0
 

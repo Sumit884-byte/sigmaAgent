@@ -904,7 +904,7 @@ def _explain_dependency_path(question, guild_id, tasks):
 
     task_rows = _aggregate_task_rows(tasks)
     task_matches = [row for row in task_rows if str(row[0]).casefold() == target_ref.casefold()]
-    is_task_id = bool(re.fullmatch(r"(?:[A-Za-z]+-\d+|T\d+)", target_ref, flags=re.IGNORECASE))
+    is_task_id = bool(re.fullmatch(r"(?:[A-Za-z][A-Za-z0-9]*-\d+|T\d+)", target_ref, flags=re.IGNORECASE))
     is_quoted_title = raw_ref.startswith(("\"", "'")) and raw_ref[-1:] == raw_ref[:1]
     if not task_matches:
         task_matches = [row for row in task_rows if str(row[1]).casefold() == target_ref.casefold()]
@@ -1017,7 +1017,7 @@ def _ownership_provenance_answer(question, guild_id, tasks):
     lowered = question.casefold()
     if "why" not in lowered or not re.search(r"\b(owner|owned|assign|assigned)\b", lowered):
         return None
-    task_match = re.search(r"\b(?:[A-Za-z]+-\d+|T\d+)\b", question, flags=re.IGNORECASE)
+    task_match = re.search(r"\b(?:[A-Za-z][A-Za-z0-9]*-\d+|T\d+)\b", question, flags=re.IGNORECASE)
     grouped_tasks = _aggregate_task_rows(tasks)
     if task_match:
         matches = [row for row in grouped_tasks if row[0].casefold() == task_match.group(0).casefold()]
@@ -1052,7 +1052,7 @@ def _relevant_task_change_context(question, guild_id, tasks):
     if not re.search(r"\bwhy\b", question, flags=re.IGNORECASE):
         return "(no task-change history requested)"
     grouped_tasks = _aggregate_task_rows(tasks)
-    ids = {match.casefold() for match in re.findall(r"\b(?:[A-Za-z]+-\d+|T\d+)\b", question, flags=re.IGNORECASE)}
+    ids = {match.casefold() for match in re.findall(r"\b(?:[A-Za-z][A-Za-z0-9]*-\d+|T\d+)\b", question, flags=re.IGNORECASE)}
     matched = [row for row in grouped_tasks if row[0].casefold() in ids]
     if not matched:
         matched = [row for row in grouped_tasks
@@ -1680,11 +1680,11 @@ DIRECT_CREATE_TASK_RE = re.compile(
     re.IGNORECASE,
 )
 DIRECT_ASSIGN_RE = re.compile(
-    r"^\s*assign\s+(?P<task>(?:[A-Za-z]+-\d+|T\d+)|[A-Za-z0-9_ -]+?)\s+to\s+(?P<dev>[A-Za-z0-9_ -]+)\s*[!.?]*\s*$",
+    r"^\s*assign\s+(?P<task>(?:[A-Za-z][A-Za-z0-9]*-\d+|T\d+)|[A-Za-z0-9_ -]+?)\s+to\s+(?P<dev>[A-Za-z0-9_ -]+)\s*[!.?]*\s*$",
     re.IGNORECASE,
 )
 DIRECT_STATUS_RE = re.compile(
-    r"^\s*(?:mark|set\s+status\s+of)\s+(?P<task>(?:[A-Za-z]+-\d+|T\d+)|[A-Za-z0-9_ -]+?)\s+(?:as\s+|to\s+)?(?P<status>todo|in\s+progress|in_progress|done|completed|finished)\s*[!.?]*\s*$",
+    r"^\s*(?:mark|set\s+status\s+of)\s+(?P<task>(?:[A-Za-z][A-Za-z0-9]*-\d+|T\d+)|[A-Za-z0-9_ -]+?)\s+(?:as\s+|to\s+)?(?P<status>todo|in\s+progress|in_progress|done|completed|finished)\s*[!.?]*\s*$",
     re.IGNORECASE,
 )
 DIRECT_LIST_TASKS_RE = re.compile(
