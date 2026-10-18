@@ -1,5 +1,6 @@
 import logging
 import os
+import tempfile
 from typing import Any
 
 import discord
@@ -125,11 +126,8 @@ async def on_message(message: discord.Message):
     question = question.strip()
 
     if not question:
-        await message.reply(
-            "Ask me a project question, for example: `@SigmaAgent Why is checkout delayed?`",
-            mention_author=False,
-        )
-        return
+        # A bare mention shows what the bot can do; the backend owns that list
+        question = "help"
 
     async with message.channel.typing():
         try:
@@ -157,4 +155,26 @@ async def on_message(message: discord.Message):
             )
 
 
+def _acquire_single_instance_lock() -> None:
+    """Refuse a second local instance: every live bot session answers each mention."""
+    lock_path = os.path.join(tempfile.gettempdir(), "sigmaagent-bot.lock")
+    lock = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+    try:
+        try:
+            import msvcrt
+
+            msvcrt.locking(lock, msvcrt.LK_NBLCK, 1)
+        except ImportError:
+            import fcntl
+
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(
+            "SigmaAgent bot is already running (single-instance lock held); "
+            "two live instances answer every mention twice."
+        )
+    os.write(lock, str(os.getpid()).encode())
+
+
+_acquire_single_instance_lock()
 client.run(DISCORD_TOKEN)

@@ -78,6 +78,7 @@ SigmaAgent also answers questions about the GitHub repository (default `Sumit884
 
 ## Troubleshooting
 
+- **Bot answers every mention twice:** more than one bot instance is live with this token — `bot.py` started twice on this machine, or the same token also running on another machine or host. The single-instance lock stops local duplicates at startup; if replies are still doubled, another machine is running the token: stop it there, or reset the token in the Discord Developer Portal (resetting signs out every session, then update `.env` everywhere).
 - **Bot online but ignores messages:** enable Message Content Intent in the Discord Developer Portal and check that the bot has channel permissions.
 - **401/403:** check backend authentication and `INVESTIGATION_API_KEY`.
 - **404:** the endpoint path is wrong; ask the API owner for the exact route.

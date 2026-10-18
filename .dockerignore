@@ -1,0 +1,14 @@
+# Secrets and local environments never go into an image; pass settings at runtime
+.env
+**/.env
+.venv/
+**/.venv/
+**/__pycache__/
+.git/
+.github/
+
+# Other services have their own images
+context retrieval/
+discord-bot/
+website/
+tests/

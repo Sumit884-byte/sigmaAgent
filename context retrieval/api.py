@@ -288,7 +288,7 @@ async def sync_channel_history(
         logger.exception("Could not read Discord channel")
         raise HTTPException(status_code=503, detail="Could not read Discord channel") from exc
     try:
-        graph = await asyncio.to_thread(connect_graph)
+        graph = await asyncio.to_thread(connect_graph, channel.get("guild_id"))
         latest_id = await asyncio.to_thread(latest_message_id, graph, channel_id)
         oldest_id = await asyncio.to_thread(oldest_message_id, graph, channel_id)
         progress = (
@@ -331,7 +331,7 @@ def retrieve_context(
             terms.extend(word for word in value.split() if len(word) > 1)
     try:
         evidence = retrieve_evidence(
-            connect_graph(),
+            connect_graph(request.guild_id),
             terms=terms,
             task_id=request.task_id,
             channel_id=request.channel_id,

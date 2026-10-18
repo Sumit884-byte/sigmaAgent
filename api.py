@@ -13,6 +13,7 @@ from google import genai
 from google.genai import errors as genai_errors
 from pydantic import BaseModel
 
+import knowledge
 from github_analysis import (
     GitHubNotFound,
     GitHubUnavailable,
@@ -42,12 +43,37 @@ CLOUD_PASSWORD = os.getenv("FALKORDB_PASSWORD", "password")
 
 # 2. Connect to database
 db = FalkorDB(host=CLOUD_HOST, port=CLOUD_PORT, username=CLOUD_USERNAME, password=CLOUD_PASSWORD)
-graph = db.select_graph("SigmaCompanyBrain")
+
+# Each Discord server gets its own FalkorDB graph, so its tasks, people and chat history never mix
+# with another server's, and graph algorithms (PageRank, WCC) only ever see one team's work
+GRAPH_PREFIX = os.getenv("FALKORDB_GRAPH_PREFIX", "Sigma_")
+TENANT_INDEXES = (("Task", "id"), ("Developer", "name"), ("TaskChange", "id"), ("DiscordMessage", "id"))
+_tenant_graphs = {}
+
+
+def tenant_graph(guild_id):
+    guild_id = str(guild_id or "")
+    if not re.fullmatch(r"[0-9]{1,20}", guild_id):
+        raise ValueError(f"invalid Discord server ID {guild_id!r}")
+    name = f"{GRAPH_PREFIX}{guild_id}"
+    if name not in _tenant_graphs:
+        graph = db.select_graph(name)
+        for label, prop in TENANT_INDEXES:
+            try:
+                graph.query(f"CREATE INDEX FOR (n:{label}) ON (n.{prop})")
+            except Exception as exc:
+                if "already indexed" not in str(exc).casefold():
+                    raise
+        knowledge.ensure_indexes(graph)
+        _tenant_graphs[name] = graph
+    return _tenant_graphs[name]
+
 
 # 3. Create the API Endpoint
 @app.get("/dependencies")
-def get_task_dependencies():
-    # Query the graph for all blocking relationships
+def get_task_dependencies(guild_id: str | None = None):
+    # Query one server's graph for all blocking relationships
+    graph = tenant_graph(guild_id or os.getenv("DISCORD_GUILD_ID"))
     query = """
     MATCH (t:Task)-[:BLOCKED_BY]->(b:Task)
 OPTIONAL MATCH (d:Developer)-[:ASSIGNED_TO]->(b)
@@ -128,6 +154,24 @@ def github_issue(number: int, repo: str = GITHUB_REPO):
 
 
 # 4. Investigation endpoint used by the Discord bot
+class KnowledgeSyncRequest(BaseModel):
+    guild_id: str
+    repo: str | None = None
+    max_commits: int | None = None
+
+
+@app.post("/knowledge/sync")
+def knowledge_sync(req: KnowledgeSyncRequest):
+    """Pull a GitHub repo's commits, issues/PRs and Markdown docs into one server's graph."""
+    try:
+        graph = tenant_graph(req.guild_id)
+        return knowledge.sync_repository(graph, req.repo or GITHUB_REPO, max_commits=req.max_commits)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (GitHubNotFound, GitHubUnavailable) as exc:
+        raise _github_http_error(exc) from exc
+
+
 class InvestigateRequest(BaseModel):
     question: str
     # Sent by the Discord bot: guild_id, channel_id, message_id, bot_name, ...
@@ -135,13 +179,17 @@ class InvestigateRequest(BaseModel):
 
 
 class TaskChange(BaseModel):
-    action: str  # create | assign | unassign | block | unblock | set_status | rename | delete
+    # create | assign | unassign | block | unblock | set_status | rename | delete
+    # | join_team | leave_team | link_github
+    action: str
     task_id: str | None = None  # existing task ID; leave empty for create
     title: str | None = None  # for create / rename
     developer: str | None = None  # for create / assign
     blocked_by: str | None = None  # ID of the blocking task, for create / block / unblock
     status: str | None = None  # todo | in_progress | done, for set_status
     inferred: bool | None = None  # block only: dependency guessed from the kind of work, not stated
+    team: str | None = None  # for join_team / leave_team
+    github_login: str | None = None  # for link_github
 
 
 class AgentReply(BaseModel):
@@ -149,15 +197,59 @@ class AgentReply(BaseModel):
     changes: list[TaskChange]
 
 
+# Everything SigmaAgent can do, in one place: the `help` reply, the fallback answer and the
+# Gemini prompt are all built from this, so the bot always describes itself accurately.
+CAPABILITIES = [
+    ("Tasks and dependencies", [
+        ("what is blocked?", "blocked tasks and what they wait on"),
+        ("what is Person 2 working on?", "someone's tasks and who waits on them"),
+        ("Priya will do the frontend", "plain-language updates create, assign, block, finish, rename or delete tasks"),
+        ("why is T2 assigned to Priya?", "who made a change, when, with a link to their message"),
+    ]),
+    ("Graph analysis (instant, shows the Cypher)", [
+        ("explain T5", "dependency chain with owners and who assigned them"),
+        ("impact Backend", "everything that slips if a task slips"),
+        ("bottlenecks", "tasks and people others wait on most (PageRank)"),
+    ]),
+    ("Who knows what", [
+        ("who knows about billing?", "people ranked by evidence: tasks, teams, commits, issues, docs, chat"),
+        ("experts", "topics and their top people"),
+        ("teams", "teams and members; say `Priya joined the payments team` to update"),
+        ("Naseem77 is Person 1 on github", "link a GitHub account to a person"),
+    ]),
+    ("GitHub and docs", [
+        ("sync github owner/repo", "pull commits, issues/PRs and Markdown docs into this server's graph"),
+        ("who are the contributors?", "commit counts per person"),
+        ("what bugs are open?", "open issues, by label, author or assignee"),
+        ("summarize issue #6", "an issue's summary and latest discussion"),
+    ]),
+]
+
+
+def _render_capabilities(markdown=True):
+    lines = []
+    for section, items in CAPABILITIES:
+        lines.append(f"**{section}**" if markdown else f"{section}:")
+        lines += [f"- `{example}`: {description}" if markdown else f"- '{example}': {description}"
+                  for example, description in items]
+    return "\n".join(lines)
+
+
 HELP_TEXT = (
-    "I answer questions about the team's task graph. Try:\n"
-    "- `what is blocked?` / `why is X delayed?`\n"
-    "- `what is <developer> working on?`\n"
-    "- `list tasks`"
+    "I'm **SigmaAgent**, this server's project brain. Mention me with a question or an update:\n\n"
+    + _render_capabilities()
+    + "\n\nAnything else, just ask: I answer from this server's tasks, chat history, docs and GitHub "
+    "and link my sources. Each server has its own graph."
+)
+HELP_RE = re.compile(
+    r"^\s*(?:help|commands|capabilities|what\s+(?:can|do)\s+you\s+do|what\s+are\s+you|who\s+are\s+you|"
+    r"how\s+do\s+i\s+use\s+you|what\s+can\s+i\s+ask(?:\s+you)?|what\s+do\s+you\s+know)\s*[?.!]*\s*$",
+    re.IGNORECASE,
 )
 
 
 def _all_tasks(guild_id):
+    graph = tenant_graph(guild_id)
     result = graph.query("""
     MATCH (t:Task {guild_id: $guild_id})
     OPTIONAL MATCH (d:Developer)-[:ASSIGNED_TO]->(t)
@@ -169,100 +261,309 @@ def _all_tasks(guild_id):
     return result.result_set
 
 
+# Graph analysis runs inside FalkorDB on this server's graph: multi-hop traversals for
+# upstream/downstream work and the critical path, PageRank for bottlenecks, WCC for workstreams.
+# BLOCKED_BY points from a task to the task it waits on, so PageRank flows to the work others need.
+TASK_OVERVIEW_QUERY = """
+MATCH (t:Task)
+OPTIONAL MATCH (d:Developer)-[:ASSIGNED_TO]->(t)
+WITH t, collect(DISTINCT d.name) AS owners
+OPTIONAL MATCH (t)-[r:BLOCKED_BY]->(b:Task)
+WITH t, owners, collect(DISTINCT [b.id, r.inferred]) AS deps
+OPTIONAL MATCH chain = (t)-[:BLOCKED_BY*1..20]->(up:Task)
+WITH t, owners, deps, collect(DISTINCT up.id) AS upstream, collect([n IN nodes(chain) | n.id]) AS chains
+OPTIONAL MATCH (down:Task)-[:BLOCKED_BY*1..20]->(t)
+WHERE coalesce(down.status, 'todo') <> 'done'
+RETURN t.id, t.title, coalesce(t.status, 'todo'), owners, deps, upstream, collect(DISTINCT down.id), chains
+ORDER BY t.id
+""".strip()
+
+CRITICAL_PATH_QUERY = """
+MATCH p = (:Task)-[:BLOCKED_BY*1..20]->(:Task)
+WHERE all(n IN nodes(p) WHERE coalesce(n.status, 'todo') <> 'done')
+WITH [n IN nodes(p) | n.id] AS chain, length(p) AS hops
+RETURN chain, hops
+ORDER BY hops DESC
+LIMIT 1
+""".strip()
+
+BOTTLENECK_QUERY = """
+CALL algo.pageRank('Task', 'BLOCKED_BY') YIELD node, score
+WITH node, score WHERE coalesce(node.status, 'todo') <> 'done'
+OPTIONAL MATCH (d:Developer)-[:ASSIGNED_TO]->(node)
+OPTIONAL MATCH (waiting:Task)-[:BLOCKED_BY*1..20]->(node)
+WHERE coalesce(waiting.status, 'todo') <> 'done'
+WITH node, score, collect(DISTINCT d.name) AS owners, count(DISTINCT waiting) AS waiting_count
+RETURN node.id, node.title, owners, score, waiting_count
+ORDER BY score DESC
+""".strip()
+
+IMPACT_QUERY = """
+MATCH p = (down:Task)-[:BLOCKED_BY*1..20]->(:Task {id: $task_id})
+WHERE coalesce(down.status, 'todo') <> 'done'
+OPTIONAL MATCH (d:Developer)-[:ASSIGNED_TO]->(down)
+WITH down, min(length(p)) AS hops, collect(DISTINCT d.name) AS owners
+RETURN down.id, down.title, hops, owners
+ORDER BY hops, down.id
+""".strip()
+
+WORKSTREAMS_QUERY = """
+CALL algo.WCC({nodeLabels: ['Task'], relationshipTypes: ['BLOCKED_BY']}) YIELD node, componentId
+RETURN componentId, collect(node.id)
+""".strip()
+
+
+def _bottlenecks(graph):
+    """Open tasks ranked by PageRank, plus each owner's share of the work they hold up."""
+    tasks = [
+        {"id": row[0], "title": row[1], "owners": row[2], "score": row[3], "waiting": row[4]}
+        for row in graph.ro_query(BOTTLENECK_QUERY).result_set
+    ]
+    people = {}
+    for task in tasks:
+        for owner in task["owners"]:
+            person = people.setdefault(owner, {"score": 0.0, "waiting": 0, "tasks": []})
+            person["score"] += task["score"]
+            person["waiting"] += task["waiting"]
+            person["tasks"].append(task["id"])
+    ranked_people = sorted(people.items(), key=lambda item: (item[1]["waiting"], item[1]["score"]), reverse=True)
+    return tasks, ranked_people
+
+
 def _dependency_report(guild_id):
-    """Describe each task's owners, dependencies, what it holds up, and what's ready, for Gemini."""
-    rows = graph.query("""
-    MATCH (t:Task {guild_id: $g})
-    OPTIONAL MATCH (d:Developer)-[:ASSIGNED_TO]->(t)
-    WITH t, collect(d.name) AS owners
-    OPTIONAL MATCH (t)-[r:BLOCKED_BY]->(b:Task)
-    RETURN t.id, t.title, coalesce(t.status, 'todo'), owners, collect([b.id, r.inferred])
-    ORDER BY t.id
-    """, {"g": guild_id}).result_set
+    """Describe each task's owners, dependencies, impact, bottlenecks and critical path, for Gemini."""
+    graph = tenant_graph(guild_id)
+    rows = graph.ro_query(TASK_OVERVIEW_QUERY).result_set
     if not rows:
         return "(no tasks for this server)"
 
-    tasks = {}
-    for task_id, title, status, owners, deps in rows:
-        tasks[task_id] = {"title": title, "status": status, "owners": owners,
-                          "deps": {dep_id: bool(inferred) for dep_id, inferred in deps if dep_id}}
-    dependents = {task_id: [] for task_id in tasks}
-    for task_id, task in tasks.items():
-        for dep_id in task["deps"]:
-            dependents.setdefault(dep_id, []).append(task_id)
-
-    def upstream(task_id, seen=None):
-        seen = set() if seen is None else seen
-        for dep_id in tasks[task_id]["deps"]:
-            if dep_id in tasks and dep_id not in seen:
-                seen.add(dep_id)
-                upstream(dep_id, seen)
-        return seen
-
-    longest_open_cache = {}
-
-    def longest_open_chain(task_id, visiting=()):
-        # Longest chain of unfinished work ending at this task (guards against cycles)
-        if task_id in visiting:
-            return []
-        if task_id in longest_open_cache:
-            return longest_open_cache[task_id]
-        if tasks[task_id]["status"] == "done":
-            longest_open_cache[task_id] = []
-            return []
-        best = []
-        for dep_id in tasks[task_id]["deps"]:
-            if dep_id in tasks:
-                chain = longest_open_chain(dep_id, visiting + (task_id,))
-                best = max(best, chain, key=len)
-        result = best + [task_id]
-        longest_open_cache[task_id] = result
-        return result
+    tasks = {
+        row[0]: {"title": row[1], "status": row[2], "owners": row[3],
+                 "deps": {dep_id: bool(inferred) for dep_id, inferred in row[4] if dep_id},
+                 "upstream": row[5], "downstream": row[6],
+                 # Longest blocker chain from this task to its root; ties go to the lowest IDs
+                 "path": max(sorted(chain for chain in row[7] if chain), key=len, default=[row[0]])}
+        for row in rows
+    }
 
     def label(task_id):
-        task = tasks[task_id]
+        task = tasks.get(task_id, {"title": "?", "status": "?"})
         return f"{task_id} {task['title']} ({task['status']})"
 
-    def dependency_chain(task_id, visiting=()):
-        """Return the longest upstream blocker chain, from this task to its root dependency."""
-        if task_id in visiting:
-            return [task_id]
-        if task_id in dependency_chain.cache:
-            return dependency_chain.cache[task_id]
-        candidates = [dependency_chain(dep_id, visiting + (task_id,))
-                      for dep_id in tasks[task_id]["deps"] if dep_id in tasks]
-        chain = [task_id] + max(candidates, key=len, default=[])
-        dependency_chain.cache[task_id] = chain
-        return chain
-
-    dependency_chain.cache = {}
+    def owners(task_id):
+        return ", ".join(tasks[task_id]["owners"]) or "unassigned" if task_id in tasks else "unknown"
 
     lines = []
     for task_id, task in tasks.items():
-        deps = [f"{label(d)}{' [inferred]' if inferred else ''}" for d, inferred in task["deps"].items() if d in tasks]
-        open_deps = [d for d in task["deps"] if d in tasks and tasks[d]["status"] != "done"]
+        deps = [f"{label(d)}{' [inferred]' if inferred else ''}" for d, inferred in task["deps"].items()]
+        open_deps = [d for d in task["deps"] if tasks.get(d, {}).get("status") != "done"]
         if task["status"] == "done":
             readiness = "finished"
         elif open_deps:
             readiness = "waiting on " + ", ".join(open_deps)
         else:
             readiness = "ready to work on now"
-        path_label = " ← ".join(
-            f"{node} ({', '.join(tasks[node]['owners']) or 'unassigned'})"
-            for node in dependency_chain(task_id)
-        )
         lines.append(
-            f"- {task_id}: {task['title']} | owner: {', '.join(task['owners']) or 'unassigned'} | status: {task['status']}\n"
+            f"- {task_id}: {task['title']} | owner: {owners(task_id)} | status: {task['status']}\n"
             f"    depends on: {'; '.join(deps) or 'nothing'}\n"
-            f"    dependency path: {path_label}\n"
-            f"    everything upstream: {', '.join(sorted(upstream(task_id))) or 'nothing'}\n"
-            f"    holds up: {', '.join(dependents.get(task_id, [])) or 'nothing'}\n"
+            f"    dependency path: {' ← '.join(f'{node} ({owners(node)})' for node in task['path'])}\n"
+            f"    everything upstream: {', '.join(sorted(task['upstream'])) or 'nothing'}\n"
+            f"    if this slips, it also delays: "
+            f"{', '.join(f'{d} ({owners(d)})' for d in sorted(task['downstream'])) or 'nothing'}\n"
             f"    {readiness}"
         )
-    critical = max((longest_open_chain(t) for t in tasks), key=len, default=[])
-    if len(critical) > 1:
-        lines.append("Longest chain of unfinished work (critical path): " + " -> ".join(label(t) for t in critical))
+
+    critical = graph.ro_query(CRITICAL_PATH_QUERY).result_set
+    if critical:
+        lines.append("Critical path (longest chain of unfinished work): "
+                     + " ← ".join(f"{label(t)} [{owners(t)}]" for t in critical[0][0]))
+
+    ranked_tasks, ranked_people = _bottlenecks(graph)
+    holding_up = [t for t in ranked_tasks if t["waiting"]]
+    if holding_up:
+        lines.append("Bottleneck tasks (PageRank over dependencies; open tasks waiting on each): " + "; ".join(
+            f"{t['id']} {t['title']} [{', '.join(t['owners']) or 'unassigned'}] holds up {t['waiting']}"
+            for t in holding_up[:5]))
+        lines.append("Bottleneck people (open tasks waiting on their work): " + "; ".join(
+            f"{name} holds up {p['waiting']} via {', '.join(p['tasks'])}"
+            for name, p in ranked_people if p["waiting"]))
+
+    streams = [sorted(ids) for _, ids in graph.ro_query(WORKSTREAMS_QUERY).result_set]
+    if len(streams) > 1:
+        lines.append("Independent workstreams (can run in parallel): "
+                     + " | ".join(", ".join(stream) for stream in sorted(streams)))
     return "\n".join(lines)
+
+
+def _cypher_block(query, params):
+    return f"```cypher\n{query}\n\n// parameters: {json.dumps(params, ensure_ascii=False)}\n```"
+
+
+def _impact_answer(question, guild_id):
+    """`impact <task>`: everything that slips if this task slips, straight from a multi-hop query."""
+    match = re.match(r"^\s*impact\b\s*(.*)$", question, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    ref = re.sub(r"^(of|on)\s+", "", match.group(1).strip(), flags=re.IGNORECASE).strip("?.,!`*_\"' ")
+    if not ref:
+        return "Usage: `@sigmaagent impact T3` (or a task title)."
+    task_id = _resolve_task(guild_id, ref)
+    if not task_id:
+        return f"I couldn't find a task matching **{ref}** in this server's graph."
+    graph = tenant_graph(guild_id)
+    title = graph.ro_query("MATCH (t:Task {id: $id}) RETURN t.title", {"id": task_id}).result_set[0][0]
+    params = {"task_id": task_id}
+    rows = graph.ro_query(IMPACT_QUERY, params).result_set
+    if not rows:
+        answer = f"Nothing unfinished depends on **{task_id}: {title}**, so a delay there doesn't hold anyone else up."
+    else:
+        people = sorted({owner for row in rows for owner in row[3]})
+        answer = (f"If **{task_id}: {title}** slips, {len(rows)} open task(s) slip with it"
+                  + (f", affecting **{', '.join(people)}**" if people else "") + ":\n"
+                  + "\n".join(f"- **{row[0]}: {row[1]}** ({', '.join(row[3]) or 'unassigned'}), "
+                               f"{'directly' if row[2] == 1 else f'{row[2]} steps away'}" for row in rows))
+    return f"{answer}\n\nGraph query used:\n{_cypher_block(IMPACT_QUERY, params)}"
+
+
+def _bottleneck_answer(question, guild_id):
+    """`bottlenecks`: PageRank over the dependency graph, rolled up per person."""
+    if not re.match(r"^\s*bottlenecks?\b\s*[?.!]*\s*$", question, flags=re.IGNORECASE):
+        return None
+    ranked_tasks, ranked_people = _bottlenecks(tenant_graph(guild_id))
+    holding_up = [t for t in ranked_tasks if t["waiting"]]
+    if not holding_up:
+        return "No unfinished task is holding up other work right now."
+    lines = ["Tasks other work is waiting on (ranked by PageRank over dependencies):"]
+    lines += [f"- **{t['id']}: {t['title']}** ({', '.join(t['owners']) or 'unassigned'}) holds up "
+              f"{t['waiting']} open task(s)" for t in holding_up]
+    people = [(name, p) for name, p in ranked_people if p["waiting"]]
+    if people:
+        lines.append("People others are waiting on: " + ", ".join(
+            f"**{name}** ({p['waiting']} task(s) via {', '.join(p['tasks'])})" for name, p in people))
+    return "\n".join(lines) + f"\n\nGraph query used:\n{_cypher_block(BOTTLENECK_QUERY, {})}"
+
+
+EXPERTS_OVERVIEW_RE = re.compile(r"^\s*(?:experts|who\s+knows\s+what)\s*[?.!]*\s*$", re.IGNORECASE)
+EXPERTISE_RE = re.compile(
+    r"^\s*(?:who\s+(?:knows|understands)(?:\s+(?:the\s+)?most)?|"
+    r"who(?:'s|\s+is)\s+(?:the\s+|an\s+|our\s+)?(?:expert|go-to(?:\s+person)?|best\s+person)|"
+    r"who\s+should\s+i\s+(?:ask|talk\s+to)|who\s+can\s+help(?:\s+me)?|experts?)"
+    r"\s+(?:about|on|in|with|for|regarding)?\s*(?P<topic>.+?)\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+TEAM_MEMBER_RE = re.compile(
+    r"^\s*(?:is|are)\s+(?P<person>.+?)\s+(?:on|in|part\s+of)\s+(?:the\s+)?(?P<team>.+?)\s+team\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+TEAMS_RE = re.compile(
+    r"^\s*(?:(?:list\s+)?teams|who(?:'s|\s+is|\s+are)\s+(?:on|in)\s+(?:the\s+)?(?P<team>.+?)\s+team)\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+SYNC_RE = re.compile(
+    r"^\s*sync\s+(?:github|repo|knowledge|docs)(?:\s+(?:repo\s+)?(?P<repo>[A-Za-z0-9][\w-]*/[\w.-]+))?\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+PEOPLE_STATEMENT_RE = re.compile(
+    r"\b(?:is|are|'s)\s+[^.?!\n]{1,40}?\s+on\s+github\b|\bgithub\s+(?:user(?:name)?|handle|account|login|id)\b|"
+    r"\bgithub\s+(?:is|=|:)\s*@?[A-Za-z0-9-]+|\bon\s+github\s+as\s+@?[A-Za-z0-9-]+|"
+    r"\blink\s+(?:github|@?[\w-]+\s+to)\b|\b(?:joined|left|is\s+on|are\s+on|moved\s+to)\s+(?:the\s+)?[\w -]+\s+team\b",
+    re.IGNORECASE,
+)
+EVIDENCE_PATHS = (
+    "(Developer)-[:ASSIGNED_TO]->(Task) · (Developer)-[:MEMBER_OF]->(Team) · "
+    "(GitHubUser)-[:AUTHORED]->(Commit)-[:TOUCHES]->(File) · (GitHubUser)-[:OPENED|ASSIGNED]->(Issue) · "
+    "(DocSection)-[:MENTIONS]->(Developer) · (DiscordAuthor)-[:AUTHORED]->(DiscordMessage)"
+)
+
+
+def _evidence_line(item):
+    label = " ".join(str(item["label"]).split())[:90]
+    text = f"{item['kind']}: {label}" if label else item["kind"]
+    return f"[{text}]({item['url']})" if item["url"] else text
+
+
+def _expertise_answer(question, guild_id, discord):
+    """`who knows about X`: people ranked by graph evidence, each with linked proof."""
+    if EXPERTS_OVERVIEW_RE.match(question):
+        graph = tenant_graph(guild_id)
+        knowledge.refresh_expertise(graph)
+        overview = knowledge.experts_overview(graph)
+        if not overview:
+            return ("I don't have enough evidence for who knows what yet. "
+                    "Run `sync github owner/repo` to bring in commits, issues and docs.")
+        lines = ["Who knows what (strongest evidence first):"]
+        lines += [f"- **{topic}**: " + ", ".join(f"**{name}** ({score:g})" for name, score in people)
+                  for topic, people in overview]
+        return "\n".join(lines) + "\n\nAsk `who knows about <topic>` to see the evidence behind any of these."
+    match = EXPERTISE_RE.match(question)
+    if not match:
+        return None
+    topic = re.sub(r"(?i)^(?:the|a|an|our|my|this|that)\s+", "", match.group("topic").strip("\"'`*_ "))
+    if not topic or not knowledge.search_terms(topic):
+        return "Usage: `@sigmaagent who knows about billing?`"
+    ranked = knowledge.expertise(tenant_graph(guild_id), topic, exclude=[discord.get("bot_name") or "sigmaagent"])
+    if not ranked:
+        return (f"I couldn't find anyone linked to **{topic}** in this server's tasks, teams, commits, issues, "
+                "docs or chat. If the code lives on GitHub, run `sync github owner/repo` first.")
+    lines = [f"Who knows about **{topic}** (ranked by evidence in the graph):"]
+    for rank, person in enumerate(ranked, 1):
+        evidence = "; ".join(_evidence_line(item) for item in person["evidence"][:3])
+        more = len(person["evidence"]) - 3
+        lines.append(f"{rank}. **{person['person']}** (score {person['score']:g}): {evidence}"
+                     + (f"; +{more} more" if more > 0 else ""))
+    return "\n".join(lines) + f"\n\nEvidence paths searched: {EVIDENCE_PATHS}"
+
+
+def _teams_answer(question, guild_id):
+    member = TEAM_MEMBER_RE.match(question)
+    if member:
+        key = " ".join(member.group("team").split()).casefold()
+        rows = {name.casefold(): (name, people) for name, people in knowledge.teams(tenant_graph(guild_id))}
+        if key not in rows:
+            return f"There's no **{member.group('team')}** team yet."
+        team_name, people = rows[key]
+        asked = [name.strip() for name in re.split(r",|\band\b", member.group("person")) if name.strip()]
+        lines = []
+        for name in asked:
+            found = next((p for p in people if p.casefold() == name.casefold()), None)
+            lines.append(f"Yes, **{found}** is on the **{team_name}** team." if found
+                         else f"No, **{name}** isn't on the **{team_name}** team.")
+        return "\n".join(lines) + f"\nMembers: {', '.join(people) or 'none'}."
+    match = TEAMS_RE.match(question)
+    if not match:
+        return None
+    rows = knowledge.teams(tenant_graph(guild_id))
+    wanted = match.group("team")
+    if wanted:
+        key = re.sub(r"(?i)\s+team$", "", " ".join(wanted.split())).casefold()
+        rows = [row for row in rows if row[0].casefold() == key]
+        if not rows:
+            return f"There's no **{wanted}** team yet. Say e.g. `Priya is on the {wanted} team` to create it."
+    if not rows:
+        return "No teams yet. Tell me who's on which team, e.g. `@sigmaagent Priya is on the payments team`."
+    return "\n".join(f"- **{name}**: {', '.join(members) or 'no members'}" for name, members in rows)
+
+
+def _sync_answer(question, guild_id):
+    match = SYNC_RE.match(question)
+    if not match:
+        return None
+    graph = tenant_graph(guild_id)
+    stored = graph.ro_query(
+        "MATCH (r:Repository) RETURN r.full_name ORDER BY r.synced_at DESC LIMIT 1").result_set
+    repo = match.group("repo") or (stored[0][0] if stored else GITHUB_REPO)
+    try:
+        counts = knowledge.sync_repository(graph, repo)
+    except GitHubNotFound:
+        return (f"I couldn't find **{repo}** on GitHub. If it's private, set `GITHUB_TOKEN` in the backend `.env`.")
+    except GitHubUnavailable as exc:
+        return f"I couldn't reach GitHub: {exc}. Nothing was changed."
+    answer = (f"Synced **{repo}** into this server's graph: {counts['commits']} commits, "
+              f"{counts['issues']} issues/PRs, {counts['documents']} docs ({counts['sections']} sections), "
+              f"expertise for {counts['topics']} topics. Try `who knows about <topic>` or `experts`.")
+    if counts["warnings"]:
+        answer += "\nNote: " + "; ".join(counts["warnings"][:3])
+    return answer
 
 
 DEPENDENCY_PATH_QUERY = """
@@ -306,6 +607,7 @@ def _aggregate_task_rows(rows):
 
 def _explain_dependency_path(question, guild_id, tasks):
     """Explain the longest blocker chain for `explain <task>` and expose its read-only query."""
+    graph = tenant_graph(guild_id)
     match = re.match(r"^\s*explain\b\s*(.*)$", question, flags=re.IGNORECASE | re.DOTALL)
     if not match:
         return None
@@ -391,6 +693,7 @@ def _explain_dependency_path(question, guild_id, tasks):
 
 def _task_change_history(guild_id, task_id=None, *, action=None, developer_name=None):
     """Return source-linked task changes, newest first, for this Discord server."""
+    graph = tenant_graph(guild_id)
     result = graph.query(
         """
         MATCH (event:TaskChange {guild_id: $guild_id})
@@ -499,7 +802,8 @@ def _channel_history(question, discord):
                       params={"channel_id": channel_id, "max_messages": 200, "mode": "incremental"}
                       ).raise_for_status()
             response = http.post("/context/retrieve", json={
-                "feature_title": question[:300], "channel_id": channel_id, "limit": 15,
+                "feature_title": question[:300], "channel_id": channel_id,
+                "guild_id": discord.get("guild_id"), "limit": 15,
             })
             response.raise_for_status()
     except httpx.HTTPError as exc:
@@ -508,7 +812,7 @@ def _channel_history(question, discord):
 
     # Keyword search misses recent statements that share no words with the question
     # ("person 1 will do auth" vs "how is the work divided"), so always add the latest messages too
-    recent = graph.query("""
+    recent = tenant_graph(discord.get("guild_id")).query("""
     MATCH (m:DiscordMessage)-[:IN_CHANNEL]->(:DiscordChannel {id: $channel_id})
     OPTIONAL MATCH (a:DiscordAuthor)-[:AUTHORED]->(m)
     RETURN m.id, m.content, m.timestamp, m.source_url, a.discord_name
@@ -537,13 +841,15 @@ def _format_task(task_id, title, developer, blocked_by, status=None):
 
 
 def _next_task_id(guild_id):
+    graph = tenant_graph(guild_id)
     ids = graph.query("MATCH (t:Task {guild_id: $g}) RETURN t.id", {"g": guild_id}).result_set
     numbers = [int(row[0][1:]) for row in ids if re.fullmatch(r"T\d+", row[0] or "")]
     return f"T{max(numbers, default=0) + 1}"
 
 
-def _developer_name(name):
+def _developer_name(guild_id, name):
     """Reuse an existing developer's spelling ("person 1" -> "Person 1") so case doesn't split people."""
+    graph = tenant_graph(guild_id)
     name = " ".join(name.split())
     existing = graph.query("MATCH (d:Developer) WHERE toLower(d.name) = toLower($name) RETURN d.name LIMIT 1",
                            {"name": name}).result_set
@@ -554,17 +860,29 @@ def _developer_name(name):
 
 def _resolve_task(guild_id, ref):
     """Turn 'T2', 't2' or a task title into this server's task ID; None if there's no such task."""
-    ref = (ref or "").strip()
+    graph = tenant_graph(guild_id)
+    # Model output can carry quotes, zero-width characters or words like "the ... task"
+    ref = re.sub(r"[\u200b-\u200f\ufeff\"'`*]", "", ref or "")
+    ref = re.sub(r"(?i)^\s*(?:the\s+)?(.*?)(?:\s+task)?\s*$", r"\1", " ".join(ref.split()))
     if not ref:
         return None
     if _task_exists(guild_id, ref.upper()):
         return ref.upper()
     match = graph.query("MATCH (t:Task {guild_id: $g}) WHERE toLower(t.title) = toLower($title) RETURN t.id LIMIT 1",
                         {"g": guild_id, "title": ref}).result_set
-    return match[0][0] if match else None
+    if match:
+        return match[0][0]
+    # Fall back to a unique partial title match ("checkout" -> "Checkout Flow"), never a guess between several
+    partial = graph.query("""
+    MATCH (t:Task {guild_id: $g})
+    WHERE toLower(t.title) CONTAINS toLower($title) OR toLower($title) CONTAINS toLower(t.title)
+    RETURN t.id LIMIT 2
+    """, {"g": guild_id, "title": ref}).result_set
+    return partial[0][0] if len(partial) == 1 else None
 
 
 def _task_exists(guild_id, task_id):
+    graph = tenant_graph(guild_id)
     return bool(graph.query("MATCH (t:Task {id: $id, guild_id: $g}) RETURN t.id",
                             {"id": task_id, "g": guild_id}).result_set)
 
@@ -682,8 +1000,72 @@ def _audit_event_params(guild_id, change, provenance, *, index, path, summary, d
     }
 
 
+# Team and GitHub-identity changes are audited like task changes, without an affected task
+PEOPLE_CHANGE_AUDIT_CLAUSE = (
+    TASK_CHANGE_AUDIT_CLAUSE
+    .replace("    event.task_id = t.id, event.task_title = t.title,\n", "")
+    .replace("MERGE (event)-[:AFFECTS]->(t)\n", "")
+)
+assert "t.id" not in PEOPLE_CHANGE_AUDIT_CLAUSE and "(t)" not in PEOPLE_CHANGE_AUDIT_CLAUSE
+
+
+def _apply_people_change(graph, guild_id, change, author, provenance, *, index, path):
+    """join_team / leave_team / link_github, each recorded with its Discord source."""
+    if not change.developer:
+        raise ValueError("no person given")
+    params = {"g": guild_id, "by": author, "dev": _developer_name(guild_id, change.developer)}
+    if change.action in ("join_team", "leave_team"):
+        if not change.team or not change.team.strip():
+            raise ValueError("no team given")
+        team_name = " ".join(change.team.split())
+        team_name = re.sub(r"(?i)\s+team$", "", team_name) or team_name
+        existing = graph.ro_query("MATCH (team:Team {key: $key}) RETURN team.name", {"key": team_name.casefold()}).result_set
+        team_name = existing[0][0] if existing else team_name
+        params.update(team=team_name, team_key=team_name.casefold())
+        if change.action == "join_team":
+            summary = f"**{params['dev']}** joined the **{team_name}** team"
+            mutation = """
+            MERGE (d:Developer {name: $dev})
+            MERGE (team:Team {key: $team_key}) ON CREATE SET team.name = $team
+            MERGE (d)-[:MEMBER_OF]->(team)
+            WITH d, team
+            """
+        else:
+            summary = f"**{params['dev']}** left the **{team_name}** team"
+            mutation = """
+            MATCH (d:Developer {name: $dev}), (team:Team {key: $team_key})
+            OPTIONAL MATCH (d)-[m:MEMBER_OF]->(team)
+            DELETE m
+            WITH DISTINCT d, team
+            """
+        tail = "MERGE (event)-[:AFFECTS_DEVELOPER]->(d) MERGE (event)-[:AFFECTS_TEAM]->(team)"
+    else:  # link_github
+        login = (change.github_login or "").strip().lstrip("@")
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", login):
+            raise ValueError("no valid GitHub username given")
+        params["login"] = login
+        summary = f"Linked GitHub **@{login}** to **{params['dev']}**"
+        mutation = """
+        MERGE (d:Developer {name: $dev})
+        MERGE (u:GitHubUser {login: $login})
+        MERGE (u)-[:SAME_AS]->(d)
+        WITH d, u
+        """
+        tail = "MERGE (event)-[:AFFECTS_DEVELOPER]->(d)"
+    params.update(_audit_event_params(
+        guild_id, change, provenance, index=index, path=path, summary=summary, developer_name=params["dev"],
+    ))
+    if change.action == "leave_team" and not graph.ro_query(
+            "MATCH (:Developer {name: $dev})-[:MEMBER_OF]->(:Team {key: $team_key}) RETURN 1",
+            {"dev": params["dev"], "team_key": params["team_key"]}).result_set:
+        raise ValueError(f"{params['dev']} isn't on the {params['team']} team")
+    graph.query(mutation + PEOPLE_CHANGE_AUDIT_CLAUSE + tail, params)
+    return summary
+
+
 def _apply_change(guild_id, change, author, provenance, *, index=0, path=""):
     """Apply one change to this server's tasks and describe it, or raise ValueError."""
+    graph = tenant_graph(guild_id)
     action = change.action
     task_id = _resolve_task(guild_id, change.task_id) or (change.task_id or "").strip().upper() or None
     blocked_by = _resolve_task(guild_id, change.blocked_by) or (change.blocked_by or "").strip().upper() or None
@@ -722,13 +1104,16 @@ def _apply_change(guild_id, change, author, provenance, *, index=0, path=""):
             )
         return result
 
+    if action in ("join_team", "leave_team", "link_github"):
+        return _apply_people_change(graph, guild_id, change, author, provenance, index=index, path=path)
+
     if not task_id or not _task_exists(guild_id, task_id):
         raise ValueError(f"task {task_id or '(none given)'} doesn't exist in this server")
 
     if action == "assign":
         if not change.developer:
             raise ValueError("no developer given")
-        params["dev"] = _developer_name(change.developer)
+        params["dev"] = _developer_name(guild_id, change.developer)
         summary = f"Assigned **{task_id}** to **{params['dev']}**"
         params.update(_audit_event_params(
             guild_id, change, provenance, index=index, path=path,
@@ -907,12 +1292,16 @@ def _answer_after_changes(gemini, question, guild_id, applied):
 def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
     context = _dependency_report(guild_id)
     change_context = _relevant_task_change_context(question, guild_id, tasks)
+    knowledge_context = knowledge.knowledge_context(tenant_graph(guild_id), question)
     history = "\n".join(
         f"- [{(m['timestamp'] or '')[:10]}] {m['author']}: {m['content'][:500]} (link: {m['source_url']})"
         for m in messages
     ) or "(no related messages)"
     prompt = (
         "You are SigmaAgent, a project assistant in the team's Discord. "
+        "Your capabilities are listed here; when someone asks what you can do or how to do something, answer from this "
+        "list and quote the exact command to type (never claim abilities that aren't listed):\n"
+        f"{_render_capabilities(markdown=False)}\n\n"
         "Answer the question using only the task graph and channel messages below. If the answer isn't in them, say so. "
         "The task graph is the source of truth for owners and blockers; use the messages for extra context "
         "and link to a message when you rely on it, as [date](link). "
@@ -931,10 +1320,23 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
         "when one person is given several pieces of work ('person 4 will do testing and the CI/CD pipeline'), "
         "create each task with that same developer. Each change is applied separately, so include every field it needs. "
         "Write task titles as short Title Case names (e.g. 'Auth', 'CI/CD Pipeline').\n"
+        "People changes: join_team (developer, team) / leave_team (developer, team) when a message says someone is on, "
+        "joined or left a team; link_github (developer, github_login) when it says a GitHub username belongs to someone. "
+        "These need no task_id.\n"
+        "One message can contain several changes of different kinds; include every one. For example "
+        "'Sam will build the billing API, and he's on the payments team' needs a create (title 'Billing API', developer 'Sam') "
+        "AND a join_team (developer 'Sam', team 'payments'). Before answering, re-read the message and check that each "
+        "stated fact about tasks, owners, dependencies, teams or GitHub accounts has its own change.\n"
+        "Docs, commits and issues: when they answer the question, cite them with their link as [title](link). "
+        "For 'who knows about X' questions, suggest asking exactly 'who knows about X' for a ranked, evidence-backed answer.\n"
         "Dependencies: 'depends on' means the task can't finish until those are done. When explaining dependencies, "
         "show the ordered dependency path (for example T5 ← T4 ← T3) and the owner of each step, "
         "say which tasks are ready to start now, "
         "and point out the critical path and who is holding up the most work. "
+        "For 'what breaks if X slips' questions use that task's 'if this slips, it also delays' line and name the affected owners; "
+        "for 'who is the bottleneck' questions use the PageRank bottleneck tasks and people; "
+        "mention independent workstreams when suggesting what can run in parallel. "
+        "Tell users they can say 'impact T3', 'bottlenecks' or 'explain T5' to see the graph query behind an answer. "
         "When tasks are created, or the user asks how tasks depend on each other, add any missing dependencies a "
         "typical software team would clearly agree with as block changes with inferred=true (e.g. Frontend depends on "
         "Auth and Backend, Testing depends on the features it tests, deployment/CI-CD release steps come after testing). "
@@ -943,10 +1345,11 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
         "(e.g. 'T2 doesn't depend on T3'). Inferred dependencies already in the graph are marked [inferred].\n"
         "When the user asks for a change, always put it in `changes` even if you think it's a bad idea; "
         "the system validates every change (missing tasks, dependency loops) and tells the user why one is rejected. "
-        "Every change must have task_id set to an existing task ID (except create).\n"
+        "Every task change must have task_id set to an existing task ID (except create).\n"
         "When you make changes, keep `answer` to a short acknowledgement and don't list the changes; they are appended for you.\n\n"
         f"Task graph for this server:\n{context}\n\n"
         f"Relevant source-backed task changes:\n{change_context}\n\n"
+        f"Related docs, commits, issues and teams:\n{knowledge_context}\n\n"
         "If the messages say who is doing what but that isn't in the task graph yet, answer from the messages, "
         "say it isn't tracked as a task yet, and suggest the user ask you to add it.\n\n"
         f"Recent and related messages from this channel (oldest first):\n{history}\n\n"
@@ -965,8 +1368,21 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
 @app.post("/investigate")
 def investigate(req: InvestigateRequest):
     discord = req.discord or {}
-    # Repository questions don't depend on a server's task graph, so answer them first
-    github_answer = answer_github_question(req.question)
+    if HELP_RE.match(req.question):
+        return {"answer": HELP_TEXT}
+    # Requests from outside Discord (e.g. curl) use the default server
+    server_id = discord.get("guild_id") if req.discord else os.getenv("DISCORD_GUILD_ID")
+    if server_id:
+        for command in (_sync_answer, _teams_answer):
+            command_answer = command(req.question, server_id)
+            if command_answer is not None:
+                return {"answer": command_answer}
+        expertise_answer = _expertise_answer(req.question, server_id, discord)
+        if expertise_answer is not None:
+            return {"answer": expertise_answer}
+    # Repository questions don't depend on a server's task graph, so answer them next
+    is_people_statement = PEOPLE_STATEMENT_RE.search(req.question) and not req.question.rstrip().endswith("?")
+    github_answer = None if is_people_statement else answer_github_question(req.question)
     if github_answer is not None:
         return {"answer": github_answer}
     # Requests from outside Discord (e.g. curl) use the default server
@@ -978,6 +1394,10 @@ def investigate(req: InvestigateRequest):
     explain_answer = _explain_dependency_path(req.question, guild_id, tasks)
     if explain_answer is not None:
         return {"answer": explain_answer}
+    for command in (_impact_answer, _bottleneck_answer):
+        command_answer = command(req.question, guild_id)
+        if command_answer is not None:
+            return {"answer": command_answer}
     ownership_answer = _ownership_provenance_answer(req.question, guild_id, tasks)
     if ownership_answer is not None:
         return {"answer": ownership_answer}
@@ -1009,7 +1429,10 @@ def investigate(req: InvestigateRequest):
                     )
                     print(f"[{guild_id}] {author}: {change.model_dump(exclude_none=True)}")
                 except ValueError as exc:
-                    target = " ".join(filter(None, [change.task_id, change.title])) or "task"
+                    print(f"[{guild_id}] rejected change {change.model_dump(exclude_none=True)!r}: {exc}")
+                    target = (" ".join(filter(None, [change.developer, change.team, change.github_login]))
+                              if change.action in ("join_team", "leave_team", "link_github")
+                              else " ".join(filter(None, [change.task_id, change.title])) or "task")
                     lines.append(f"- Couldn't {change.action.replace('_', ' ')} {target}: {exc}")
             answer = reply.answer.strip()
             if applied and "?" in req.question:

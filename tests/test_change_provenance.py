@@ -26,6 +26,9 @@ class RecordingGraph:
         self.dependencies = []
         self.report_rows = []
 
+    def ro_query(self, query, params=None):
+        return self.query(query, params)
+
     def query(self, query, params=None):
         params = params or {}
         self.queries.append((query, params))
@@ -107,8 +110,9 @@ with patch.object(falkordb, "FalkorDB", return_value=SimpleNamespace(select_grap
 class ChangeProvenanceTests(unittest.TestCase):
     def setUp(self):
         self.graph = RecordingGraph()
-        self.original_graph = api.graph
-        api.graph = self.graph
+        # Every server's graph resolves to the recording fake
+        self.original_tenant_graph = api.tenant_graph
+        api.tenant_graph = lambda _guild_id: self.graph
         self.client = TestClient(api.app)
         self.discord = {
             "guild_id": "123456789012345678",
@@ -121,7 +125,7 @@ class ChangeProvenanceTests(unittest.TestCase):
         }
 
     def tearDown(self):
-        api.graph = self.original_graph
+        api.tenant_graph = self.original_tenant_graph
 
     def test_discord_assignment_is_audited_and_why_answer_links_source(self):
         change_reply = api.AgentReply(
@@ -288,19 +292,27 @@ class ChangeProvenanceTests(unittest.TestCase):
         self.assertEqual(len(history_queries), 1)
 
     def test_dependency_report_contains_paths_without_global_audit_history(self):
+        # Rows as returned by TASK_OVERVIEW_QUERY: ..., upstream, downstream, blocker chains
         self.graph.report_rows = [
-            ["T1", "Frontend", "todo", ["Person 1"], [["T2", False], ["T3", False]]],
-            ["T2", "Auth", "todo", ["Person 2"], [["T4", False]]],
-            ["T3", "Backend", "todo", ["Person 3"], [["T4", False]]],
-            ["T4", "API", "todo", ["Person 4"], [["T5", False]]],
-            ["T5", "Database", "todo", ["Person 5"], []],
+            ["T1", "Frontend", "todo", ["Person 1"], [["T2", False], ["T3", False]],
+             ["T2", "T3", "T4", "T5"], [],
+             [["T1", "T3", "T4", "T5"], ["T1", "T2", "T4", "T5"], ["T1", "T2"], ["T1", "T3"]]],
+            ["T2", "Auth", "todo", ["Person 2"], [["T4", False]], ["T4", "T5"], ["T1"], [["T2", "T4", "T5"]]],
+            ["T3", "Backend", "todo", ["Person 3"], [["T4", False]], ["T4", "T5"], ["T1"], [["T3", "T4", "T5"]]],
+            ["T4", "API", "todo", ["Person 4"], [["T5", False]], ["T5"], ["T1", "T2", "T3"], [["T4", "T5"]]],
+            ["T5", "Database", "todo", ["Person 5"], [], [], ["T1", "T2", "T3", "T4"], []],
         ]
         self.graph.queries.clear()
 
         report = api._dependency_report(self.discord["guild_id"])
 
         self.assertIn("dependency path: T1 (Person 1) ← T2 (Person 2) ← T4 (Person 4) ← T5 (Person 5)", report)
-        self.assertEqual(len(self.graph.queries), 1)
+        self.assertIn("if this slips, it also delays: T1 (Person 1), T2 (Person 2), T3 (Person 3), T4 (Person 4)",
+                      report)
+        # Only the read-only graph analysis queries run; no global audit history is fetched
+        self.assertEqual([query for query, _ in self.graph.queries], [
+            api.TASK_OVERVIEW_QUERY, api.CRITICAL_PATH_QUERY, api.BOTTLENECK_QUERY, api.WORKSTREAMS_QUERY,
+        ])
         self.assertFalse(any("TaskChange" in query for query, _ in self.graph.queries))
 
     def test_every_mutation_action_writes_its_audit_event(self):
@@ -343,7 +355,7 @@ class FalkorDbProvenanceIntegrationTests(unittest.TestCase):
         developer_name = f"Person 4 {uuid.uuid4().hex[:6]}"
         source_message_id = str(500000000000000000 + uuid.uuid4().int % 300000000000000000)
         actor_id = str(800000000000000000 + uuid.uuid4().int % 100000000000000000)
-        api.graph = graph
+        api.tenant_graph = lambda _guild_id: graph
         client = TestClient(api.app)
         try:
             graph.query(
@@ -461,7 +473,7 @@ class FalkorDbDependencyPathIntegrationTests(unittest.TestCase):
             password=os.getenv("FALKORDB_PASSWORD") or None,
         ).select_graph(graph_name)
         guild_id = "123456789012345678"
-        api.graph = graph
+        api.tenant_graph = lambda _guild_id: graph
         client = TestClient(api.app)
         try:
             graph.query("""

@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same Python as the Docker images
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            context retrieval/requirements.txt
+            discord-bot/requirements.txt
+
+      - name: Install dependencies
+        run: >
+          pip install -r requirements.txt
+          -r "context retrieval/requirements.txt"
+          -r discord-bot/requirements.txt
+
+      - name: Check every Python file compiles
+        run: python -m compileall -q -x '/(\.venv|node_modules)/' .
+
+      - name: API tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Context retrieval tests
+        working-directory: context retrieval
+        run: python -m unittest discover -s tests -v
+
+  website:
+    name: Website lint and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  docker:
+    name: Docker build (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            context: .
+          - name: context-retrieval
+            context: context retrieval
+          - name: discord-bot
+            context: discord-bot
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
