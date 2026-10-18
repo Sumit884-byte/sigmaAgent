@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -214,6 +215,9 @@ MERGE (i)-[:IN_REPO]->(repo)
 MERGE (author:GitHubUser {login: row.author})
 MERGE (author)-[:OPENED]->(i)
 WITH i, row
+OPTIONAL MATCH (:GitHubUser)-[old:ASSIGNED]->(i)
+DELETE old
+WITH DISTINCT i, row
 UNWIND row.assignees AS login
 MERGE (assignee:GitHubUser {login: login})
 MERGE (assignee)-[:ASSIGNED]->(i)
@@ -271,6 +275,7 @@ def sync_repository(graph: Any, repo: str, *, max_commits: int | None = None) ->
     # Commits and the files each one touched
     commits = gh_get(f"/repos/{repo}/commits", {"per_page": str(max_commits), "sha": branch})
     rows, task_links = [], []
+    file_lists_available = True
     for item in commits if isinstance(commits, list) else []:
         sha = item.get("sha")
         if not sha:
@@ -278,8 +283,8 @@ def sync_repository(graph: Any, repo: str, *, max_commits: int | None = None) ->
         files = []
         is_merge = len(item.get("parents") or []) > 1
         try:
-            if is_merge:
-                raise StopIteration  # a merge's files belong to the commits it merges
+            if is_merge or not file_lists_available:
+                raise StopIteration  # merges' files belong to their commits; or GitHub already refused
             detail = gh_get(f"/repos/{repo}/commits/{sha}")
             files = [{"path": f.get("filename"), "additions": int(f.get("additions") or 0),
                       "deletions": int(f.get("deletions") or 0),
@@ -288,8 +293,8 @@ def sync_repository(graph: Any, repo: str, *, max_commits: int | None = None) ->
         except StopIteration:
             pass
         except GitHubUnavailable as exc:
-            if not warnings:
-                warnings.append(f"file lists stopped early: {exc}")
+            file_lists_available = False
+            warnings.append(f"file lists stopped early: {exc}")
         commit = item.get("commit") or {}
         message = (commit.get("message") or "").strip()
         user = item.get("author") or {}
@@ -357,6 +362,15 @@ def sync_repository(graph: Any, repo: str, *, max_commits: int | None = None) ->
         graph.query(DOC_UPSERT, {"repo": repo, "docs": docs, "now": _now()})
         graph.query(SECTION_UPSERT, {"sections": sections})
         graph.query("MATCH (doc:Document), (f:File {key: doc.key}) MERGE (doc)-[:STORED_AS]->(f)")
+    if not tree.get("truncated"):
+        # Keep every listed path (even ones skipped by a transient fetch error); drop the rest
+        listed = [f"{repo}:{path}" for path in paths]
+        graph.query("""
+        MATCH (doc:Document {repo: $repo})
+        WHERE NOT doc.key IN $listed
+        OPTIONAL MATCH (doc)-[:HAS_SECTION]->(sec:DocSection)
+        DETACH DELETE sec, doc
+        """, {"repo": repo, "listed": listed})
     _link(graph, "DocSection", task_links)
     _link(graph, "DocSectionPerson", person_links)
 
@@ -493,8 +507,16 @@ def candidate_topics(graph: Any, *, limit: int = 40) -> list[str]:
     return topics[:limit]
 
 
+_expertise_lock = threading.Lock()
+
+
 def refresh_expertise(graph: Any) -> int:
     """Rebuild (person)-[:EXPERT_IN {score, evidence}]->(:Topic) from the current evidence."""
+    with _expertise_lock:
+        return _refresh_expertise(graph)
+
+
+def _refresh_expertise(graph: Any) -> int:
     graph.query("MATCH ()-[e:EXPERT_IN]->() DELETE e")
     topics = candidate_topics(graph)
     for topic in topics:

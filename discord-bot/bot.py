@@ -19,7 +19,7 @@ log = logging.getLogger("sigmaagent-bot")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 INVESTIGATION_API_URL = os.getenv("INVESTIGATION_API_URL")
 INVESTIGATION_API_KEY = os.getenv("INVESTIGATION_API_KEY", "")
-API_TIMEOUT_SECONDS = float(os.getenv("API_TIMEOUT_SECONDS", "45"))
+API_TIMEOUT_SECONDS = float(os.getenv("API_TIMEOUT_SECONDS", "120"))
 DISCORD_STREAM_URL = os.getenv(
     "DISCORD_STREAM_URL",
     INVESTIGATION_API_URL.replace("/investigate", "/discord/stream-message")
@@ -39,6 +39,14 @@ intents.message_content = True
 intents.members = False
 
 client = discord.Client(intents=intents)
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def run_in_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def extract_answer(data: Any) -> str:
@@ -113,7 +121,7 @@ def is_channel_allowed(channel_id: str | int | None) -> bool:
 
 async def stream_message_to_graph(message: discord.Message) -> None:
     """Asynchronously stream a Discord message to the company brain graph in real time."""
-    if not DISCORD_STREAM_URL or message.author.bot:
+    if not DISCORD_STREAM_URL or message.author.bot or message.guild is None:
         return
     if not is_channel_allowed(message.channel.id):
         log.debug("Channel %s is not allowlisted; skipping real-time message streaming.", message.channel.id)
@@ -186,11 +194,32 @@ async def stream_message_delete_to_graph(message_id: str, guild_id: str | None =
         log.warning("Real-time stream delete failed for message %s: %s", message_id, exc)
 
 
+def split_message(text: str, limit: int = 1900) -> list[str]:
+    """Split for Discord's 2,000-character limit at line breaks, closing and reopening ``` blocks."""
+    chunks, current, in_code = [], "", False
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:  # a single overlong line: hard-split it
+            line_head, line = line[:limit], line[limit:]
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line_head)
+        if len(current) + len(line) > limit - 8:  # room for a closing fence
+            chunks.append(current + ("\n```" if in_code else ""))
+            current = "```\n" if in_code else ""
+        current += line
+        if line.lstrip().startswith("```"):
+            in_code = not in_code
+    if current.strip():
+        chunks.append(current)
+    return [chunk for chunk in chunks if chunk.strip()]
+
+
 async def send_long_message(channel: discord.abc.Messageable, text: str) -> None:
     # Discord messages have a 2,000-character limit.
     text = text.strip() or "The investigation API returned no answer."
-    for start in range(0, len(text), 1900):
-        await channel.send(text[start : start + 1900])
+    for chunk in split_message(text):
+        await channel.send(chunk)
 
 
 @client.event
@@ -204,7 +233,7 @@ async def on_message(message: discord.Message):
         return
 
     # Real-time message streaming: keep the company brain graph continuously current
-    asyncio.create_task(stream_message_to_graph(message))
+    run_in_background(stream_message_to_graph(message))
 
     # Only respond when mentioned; avoids replying to every channel message.
     # Discord's autocomplete offers both the bot user and its same-named managed role,
@@ -227,52 +256,61 @@ async def on_message(message: discord.Message):
         # A bare mention shows what the bot can do; the backend owns that list
         question = "help"
 
-    async with message.channel.typing():
-        try:
+    try:
+        async with message.channel.typing():
             answer = await investigate(question, message)
-            await send_long_message(message.channel, f"**SigmaAgent investigation**\n{answer}")
-        except httpx.HTTPStatusError as exc:
-            log.exception("Investigation API returned HTTP %s", exc.response.status_code)
-            await message.reply(
-                f"The investigation API returned HTTP {exc.response.status_code}. "
-                "Please check the configured endpoint and backend logs.",
-                mention_author=False,
-            )
-        except httpx.RequestError:
-            log.exception("Could not reach investigation API")
-            await message.reply(
-                "I couldn't reach the investigation API. Check that the backend is running "
-                "and `INVESTIGATION_API_URL` is correct.",
-                mention_author=False,
-            )
-        except Exception:
-            log.exception("Unexpected error while handling a mention")
-            await message.reply(
-                "Something went wrong while investigating. Check the bot logs for details.",
-                mention_author=False,
-            )
+        await send_long_message(message.channel, f"**SigmaAgent investigation**\n{answer}")
+    except discord.Forbidden:
+        log.warning("Missing permission to type or reply in channel %s", message.channel.id)
+    except httpx.HTTPStatusError as exc:
+        log.exception("Investigation API returned HTTP %s", exc.response.status_code)
+        await message.reply(
+            f"The investigation API returned HTTP {exc.response.status_code}. "
+            "Please check the configured endpoint and backend logs.",
+            mention_author=False,
+        )
+    except httpx.TimeoutException:
+        log.exception("Investigation API timed out after %ss", API_TIMEOUT_SECONDS)
+        await message.reply(
+            "That took longer than I can wait (the language model is probably slow or rate-limited). "
+            "Please try again in a minute.",
+            mention_author=False,
+        )
+    except httpx.RequestError:
+        log.exception("Could not reach investigation API")
+        await message.reply(
+            "I couldn't reach the investigation API. Check that the backend is running "
+            "and `INVESTIGATION_API_URL` is correct.",
+            mention_author=False,
+        )
+    except Exception:
+        log.exception("Unexpected error while handling a mention")
+        await message.reply(
+            "Something went wrong while investigating. Check the bot logs for details.",
+            mention_author=False,
+        )
 
 
 @client.event
 async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     """Keep the graph current when a user edits their Discord message."""
-    if not is_channel_allowed(payload.channel_id):
+    if payload.guild_id is None or not is_channel_allowed(payload.channel_id):
         return
     data = payload.data or {}
     new_content = data.get("content")
     if new_content and payload.message_id:
         guild_id = str(payload.guild_id) if payload.guild_id else None
-        asyncio.create_task(stream_message_edit_to_graph(str(payload.message_id), new_content, guild_id))
+        run_in_background(stream_message_edit_to_graph(str(payload.message_id), new_content, guild_id))
 
 
 @client.event
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     """Keep the graph current when a user deletes their Discord message."""
-    if not is_channel_allowed(payload.channel_id):
+    if payload.guild_id is None or not is_channel_allowed(payload.channel_id):
         return
     if payload.message_id:
         guild_id = str(payload.guild_id) if payload.guild_id else None
-        asyncio.create_task(stream_message_delete_to_graph(str(payload.message_id), guild_id))
+        run_in_background(stream_message_delete_to_graph(str(payload.message_id), guild_id))
 
 
 def _acquire_single_instance_lock() -> None:

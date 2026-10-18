@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -107,7 +108,10 @@ GITHUB_REPO = os.getenv("GITHUB_REPO", "Sumit884-byte/sigmaAgent")
 
 
 def _default_graph_provider():
-    guild_id = os.getenv("DISCORD_GUILD_ID", "1")
+    # Without a configured server there is no graph to sync into; never invent one
+    guild_id = os.getenv("DISCORD_GUILD_ID", "").strip()
+    if not guild_id:
+        return None
     try:
         return tenant_graph(guild_id)
     except Exception:
@@ -132,8 +136,9 @@ app = FastAPI(title="Sigma Agent API", lifespan=lifespan)
 
 # 3. Create the API Endpoint
 @app.get("/dependencies")
-def get_task_dependencies(guild_id: str | None = None):
+def get_task_dependencies(request: Request, guild_id: str | None = None):
     # Query one server's graph for all blocking relationships
+    _verify_internal_api_key(request)
     graph = tenant_graph(guild_id or os.getenv("DISCORD_GUILD_ID"))
     query = """
     MATCH (t:Task)-[:BLOCKED_BY]->(b:Task)
@@ -262,7 +267,7 @@ def _resolve_guild_for_repo(repo: str, request: Request | None = None) -> str:
         pass
 
     default_guild = os.getenv("DISCORD_GUILD_ID")
-    if default_guild:
+    if default_guild and repo.casefold() == GITHUB_REPO.casefold():
         return str(default_guild)
 
     if os.getenv("ALLOW_INSECURE_WEBHOOKS", "").lower() in ("true", "1", "yes"):
@@ -1224,8 +1229,11 @@ def _developer_name(guild_id, name):
     return name[:1].upper() + name[1:] if name.islower() else name
 
 
-def _resolve_task(guild_id, ref):
-    """Turn 'T2', 't2' or a task title into this server's task ID; None if there's no such task."""
+def _resolve_task(guild_id, ref, *, exact=False):
+    """Turn 'T2', 't2' or a task title into this server's task ID; None if there's no such task.
+
+    exact=True skips the partial-title fallback (used for deletes, which can't be undone).
+    """
     graph = tenant_graph(guild_id)
     # Model output can carry quotes, zero-width characters or words like "the ... task"
     ref = re.sub(r"[\u200b-\u200f\ufeff\"'`*]", "", ref or "")
@@ -1238,6 +1246,8 @@ def _resolve_task(guild_id, ref):
                         {"g": guild_id, "title": ref}).result_set
     if match:
         return match[0][0]
+    if exact:
+        return None
     # Fall back to a unique partial title match ("checkout" -> "Checkout Flow"), never a guess between several
     partial = graph.query("""
     MATCH (t:Task {guild_id: $g})
@@ -1429,11 +1439,30 @@ def _apply_people_change(graph, guild_id, change, author, provenance, *, index, 
     return summary
 
 
+# Two messages creating tasks at once must not both get the same next ID
+_create_locks: dict[str, threading.Lock] = {}
+_create_locks_guard = threading.Lock()
+
+
+def _create_lock(guild_id):
+    with _create_locks_guard:
+        return _create_locks.setdefault(str(guild_id), threading.Lock())
+
+
+# "assign T3 to me": the sender, not a new developer called "Me"
+SELF_REFERENCES = {"me", "myself", "i", "i'll", "im", "i'm"}
+
+
 def _apply_change(guild_id, change, author, provenance, *, index=0, path=""):
     """Apply one change to this server's tasks and describe it, or raise ValueError."""
     graph = tenant_graph(guild_id)
+    if change.developer and change.developer.strip().casefold() in SELF_REFERENCES:
+        if not author or author == "someone":
+            raise ValueError("can't tell who 'me' is without a Discord author")
+        change = change.model_copy(update={"developer": author})
     action = change.action
-    task_id = _resolve_task(guild_id, change.task_id) or (change.task_id or "").strip().upper() or None
+    task_id = (_resolve_task(guild_id, change.task_id, exact=action == "delete")
+               or (change.task_id or "").strip().upper() or None)
     blocked_by = _resolve_task(guild_id, change.blocked_by) or (change.blocked_by or "").strip().upper() or None
     params = {"g": guild_id, "id": task_id, "by": author}
 
@@ -1451,13 +1480,14 @@ def _apply_change(guild_id, change, author, provenance, *, index=0, path=""):
     if action == "create":
         if not change.title:
             raise ValueError("a new task needs a title")
-        params.update(id=_next_task_id(guild_id), title=change.title.strip())
-        result = f"Created **{params['id']}: {params['title']}**"
-        task_id = params["id"]
-        params.update(_audit_event_params(
-            guild_id, change, provenance, index=index, path=path, summary=result,
-        ))
-        graph.query(TASK_CREATE_AUDIT_QUERY, params)
+        with _create_lock(guild_id):
+            params.update(id=_next_task_id(guild_id), title=change.title.strip())
+            result = f"Created **{params['id']}: {params['title']}**"
+            task_id = params["id"]
+            params.update(_audit_event_params(
+                guild_id, change, provenance, index=index, path=path, summary=result,
+            ))
+            graph.query(TASK_CREATE_AUDIT_QUERY, params)
         if change.developer:
             result += "; " + _apply_change(
                 guild_id, TaskChange(action="assign", task_id=task_id, developer=change.developer),
@@ -1776,6 +1806,11 @@ DIRECT_LIST_TASKS_RE = re.compile(
 )
 
 
+def _looks_compound(*parts):
+    """'T2 as done and T3' or 'Priya and T4 to Sam' carry more than one change."""
+    return any(re.search(r"\band\b|,|;|&", part or "", re.IGNORECASE) for part in parts)
+
+
 def _direct_task_command_answer(question, guild_id, discord):
     """Direct, deterministic task commands that execute immediately without requiring LLM quota."""
     if DIRECT_LIST_TASKS_RE.match(question):
@@ -1784,7 +1819,7 @@ def _direct_task_command_answer(question, guild_id, discord):
             return "There are no tasks tracked in this server's graph yet."
         grouped = _aggregate_task_rows(tasks)
         lines = ["**Tasks in this server:**"]
-        for tid, title, owners, status, _ in grouped:
+        for tid, title, owners, _blockers, status in grouped:
             owner_str = f" ({', '.join(owners)})" if owners else " (unassigned)"
             status_str = f" [{status}]" if status and status != "todo" else ""
             lines.append(f"- **{tid}**: {title}{owner_str}{status_str}")
@@ -1820,13 +1855,15 @@ def _direct_task_command_answer(question, guild_id, discord):
     if match:
         task_ref = match.group("task").strip()
         raw_dev = match.group("dev").strip()
+        if _looks_compound(task_ref, raw_dev):
+            return None
+        if raw_dev.casefold() in SELF_REFERENCES:
+            raw_dev = author
         graph = tenant_graph(guild_id)
         dev = _clean_developer_name(raw_dev, graph)
-        if not dev:
-            return f"I couldn't identify '{raw_dev}' as a developer. Please name a person to assign to."
         task_id = _resolve_task(guild_id, task_ref)
-        if not task_id:
-            return f"I couldn't find a task matching '{task_ref}'."
+        if not dev or not task_id:
+            return None  # not a clean single assignment; Gemini can interpret it
         change = TaskChange(action="assign", task_id=task_id, developer=dev)
         try:
             applied_summary = _apply_change(guild_id, change, author, provenance)
@@ -1838,6 +1875,8 @@ def _direct_task_command_answer(question, guild_id, discord):
     match = DIRECT_STATUS_RE.match(question)
     if match:
         task_ref = match.group("task").strip()
+        if _looks_compound(task_ref):
+            return None
         raw_status = match.group("status").strip().lower()
         if raw_status in ("completed", "finished", "done"):
             status_val = "done"
@@ -1847,7 +1886,7 @@ def _direct_task_command_answer(question, guild_id, discord):
             status_val = "todo"
         task_id = _resolve_task(guild_id, task_ref)
         if not task_id:
-            return f"I couldn't find a task matching '{task_ref}'."
+            return None  # let Gemini interpret an unclear task reference
         change = TaskChange(action="set_status", task_id=task_id, status=status_val)
         try:
             applied_summary = _apply_change(guild_id, change, author, provenance)
@@ -1860,7 +1899,10 @@ def _direct_task_command_answer(question, guild_id, discord):
 
 
 @app.post("/investigate")
-def investigate(req: InvestigateRequest):
+def investigate(req: InvestigateRequest, request: Request):
+    # The bot and the website proxy send INVESTIGATION_API_KEY; without it anyone could
+    # read or change any server's tasks by naming its guild_id
+    _verify_internal_api_key(request)
 
     discord = req.discord or {}
     read_only = req.read_only or not discord
@@ -1913,6 +1955,8 @@ def investigate(req: InvestigateRequest):
             author = discord.get("author_name") or "someone"
             messages = _channel_history(req.question, discord)
             reply = _ask_gemini(gemini, req.question, guild_id, messages, author, tasks)
+            if reply is None:
+                raise ValueError("the model's reply could not be parsed")
         except GeminiUnavailable:
             return _format_investigate_response("Gemini is out of free quota or overloaded on every model I can use, "
                                               "so I can't answer properly right now; nothing was changed. "
@@ -1938,7 +1982,7 @@ def investigate(req: InvestigateRequest):
                         f"- {_apply_change(guild_id, change, author, provenance, index=index)}"
                     )
                     print(f"[{guild_id}] {author}: {change.model_dump(exclude_none=True)}")
-                except ValueError as exc:
+                except Exception as exc:
                     print(f"[{guild_id}] rejected change {change.model_dump(exclude_none=True)!r}: {exc}")
                     target = (" ".join(filter(None, [change.developer, change.team, change.github_login]))
                               if change.action in ("join_team", "leave_team", "link_github")

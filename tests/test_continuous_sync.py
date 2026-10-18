@@ -272,13 +272,26 @@ class ApiWebhookEndpointTests(unittest.TestCase):
 
 
 class BackgroundSyncerLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_syncer_does_not_start_without_a_github_token(self):
+        # Unauthenticated syncs would use up GitHub's 60 requests/hour and break live GitHub answers
+        syncer = BackgroundKnowledgeSyncer(
+            graph_provider=lambda: MockGraph(),
+            default_repo="Sumit884-byte/sigmaAgent",
+            interval_seconds=60,
+        )
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "", "GH_TOKEN": ""}):
+            syncer.start()
+        self.assertFalse(syncer.running)
+        self.assertIsNone(syncer.task)
+
     async def test_syncer_start_and_stop(self):
         syncer = BackgroundKnowledgeSyncer(
             graph_provider=lambda: MockGraph(),
             default_repo="Sumit884-byte/sigmaAgent",
             interval_seconds=60,
         )
-        syncer.start()
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}):
+            syncer.start()
         self.assertTrue(syncer.running)
         self.assertIsNotNone(syncer.task)
 
@@ -300,7 +313,8 @@ class BackgroundSyncerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(syncer.total_sync_count, 1)
         self.assertIsNotNone(syncer.last_sync_time)
         mock_sync.assert_called_once_with(graph, "Sumit884-byte/sigmaAgent")
-        mock_refresh.assert_called_once_with(graph)
+        # sync_repository already rebuilds expertise; sync_now must not rebuild it a second time
+        mock_refresh.assert_not_called()
 
 
 class DiscordStreamingTests(unittest.TestCase):
@@ -373,6 +387,9 @@ class SyncerGCTests(unittest.IsolatedAsyncioTestCase):
 
 class DiscordAndGCApiTests(unittest.TestCase):
     def setUp(self):
+        investigation_key = patch.dict(os.environ, {"INVESTIGATION_API_KEY": "test-internal-key"})
+        investigation_key.start()
+        self.addCleanup(investigation_key.stop)
         self.client = TestClient(app)
         self.mock_graph = MockGraph()
         self.headers = {"Authorization": "Bearer test-internal-key"}
@@ -426,7 +443,8 @@ class DiscordAndGCApiTests(unittest.TestCase):
 
     def test_run_gc_chat_command_returns_safety_advisory(self):
         with patch.object(api, "tenant_graph", return_value=self.mock_graph):
-            res = self.client.post("/investigate", json={"question": "run gc", "discord": {"guild_id": "12345"}})
+            res = self.client.post("/investigate", json={"question": "run gc", "discord": {"guild_id": "12345"}},
+                                   headers=self.headers)
             self.assertEqual(res.status_code, 200)
             self.assertIn("Garbage collection modifies graph state", res.json()["answer"])
 

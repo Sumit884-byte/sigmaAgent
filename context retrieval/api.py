@@ -18,8 +18,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from dotenv import load_dotenv
 
 from graph_store import (
-    connect_graph, import_messages, latest_message_id, oldest_message_id,
-    retrieve_evidence, save_sync_progress, sync_progress,
+    connect_graph, import_messages, oldest_message_id,
+    retrieve_evidence, save_sync_progress, save_sync_watermark, sync_progress, sync_watermark,
 )
 from models import DISCORD_CHANNEL_ID_PATTERN, ContextRequest, DiscordMessage
 
@@ -38,7 +38,9 @@ def require_context_api_key(x_context_api_key: str | None = Header(default=None)
     expected = os.getenv("CONTEXT_API_KEY")
     if not expected or len(expected) < 32:
         raise HTTPException(status_code=503, detail="Context API authentication is not configured")
-    if not x_context_api_key or not secrets.compare_digest(x_context_api_key, expected):
+    # Compare bytes: compare_digest raises TypeError on non-ASCII str (header values are latin-1)
+    if not x_context_api_key or not secrets.compare_digest(
+            x_context_api_key.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
@@ -289,7 +291,8 @@ async def sync_channel_history(
         raise HTTPException(status_code=503, detail="Could not read Discord channel") from exc
     try:
         graph = await asyncio.to_thread(connect_graph, channel.get("guild_id"))
-        latest_id = await asyncio.to_thread(latest_message_id, graph, channel_id)
+        # Resume from what sync itself has covered, not the newest (possibly live-streamed) message
+        latest_id = await asyncio.to_thread(sync_watermark, graph, channel_id)
         oldest_id = await asyncio.to_thread(oldest_message_id, graph, channel_id)
         progress = (
             await asyncio.to_thread(sync_progress, graph, channel_id)
@@ -307,6 +310,13 @@ async def sync_channel_history(
         counts = await asyncio.to_thread(import_messages, graph, messages)
         if mode == "incremental":
             await asyncio.to_thread(save_sync_progress, graph, channel_id, baseline_id, cursor_id)
+            if cursor_id is None:
+                # Caught up: everything through the newest fetched message is now in the graph
+                ids = [int(m.id) for m in messages if str(m.id).isdigit()]
+                if latest_id and latest_id.isdigit():
+                    ids.append(int(latest_id))
+                if ids:
+                    await asyncio.to_thread(save_sync_watermark, graph, channel_id, str(max(ids)))
     except Exception as exc:
         logger.exception("Could not import Discord history")
         raise HTTPException(status_code=503, detail="Could not import history into FalkorDB") from exc
