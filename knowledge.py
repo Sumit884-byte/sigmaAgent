@@ -196,7 +196,8 @@ UNWIND row.files AS f
 MERGE (file:File {key: $repo + ':' + f.path})
 SET file.path = f.path, file.repo = $repo, file.url = f.url
 MERGE (c)-[t:TOUCHES]->(file)
-SET t.additions = f.additions, t.deletions = f.deletions
+SET t.additions = CASE WHEN f.additions > 0 THEN f.additions ELSE coalesce(t.additions, 0) END,
+    t.deletions = CASE WHEN f.deletions > 0 THEN f.deletions ELSE coalesce(t.deletions, 0) END
 """
 
 ISSUE_UPSERT = """

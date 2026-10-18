@@ -12,7 +12,15 @@ import falkordb
 from fastapi.testclient import TestClient
 
 import continuous_sync
-from continuous_sync import BackgroundKnowledgeSyncer, handle_github_webhook, verify_github_signature
+from continuous_sync import (
+    BackgroundKnowledgeSyncer,
+    handle_discord_message_delete,
+    handle_discord_message_edit,
+    handle_discord_stream_message,
+    handle_github_webhook,
+    prune_graph_garbage,
+    verify_github_signature,
+)
 
 # Mock FalkorDB connection for test environment
 with patch.object(falkordb, "FalkorDB", return_value=SimpleNamespace(select_graph=lambda _name: None)):
@@ -79,7 +87,14 @@ class SignatureVerificationTests(unittest.TestCase):
         self.assertFalse(verify_github_signature(body, "invalid-sig", secret))
         self.assertFalse(verify_github_signature(body, "md5=12345", secret))
 
-    def test_no_secret_configured_is_permissive(self):
+    def test_no_secret_configured_rejects_by_default(self):
+        """Without a secret configured the endpoint must be closed off by default."""
+        body = b'{"foo": "bar"}'
+        self.assertFalse(verify_github_signature(body, None, ""))
+
+    @patch.dict(os.environ, {"ALLOW_INSECURE_WEBHOOKS": "true"})
+    def test_no_secret_with_dev_flag_is_permissive(self):
+        """With ALLOW_INSECURE_WEBHOOKS=true the endpoint accepts unsigned requests in dev/CI."""
         body = b'{"foo": "bar"}'
         self.assertTrue(verify_github_signature(body, None, ""))
 
@@ -185,8 +200,10 @@ class ApiWebhookEndpointTests(unittest.TestCase):
         self.client = TestClient(app)
         self.mock_graph = MockGraph()
 
+    @patch.dict(os.environ, {"ALLOW_INSECURE_WEBHOOKS": "true"})
     @patch("api.tenant_graph")
     def test_webhook_endpoint_success(self, mock_tenant_graph):
+        """A correctly formed webhook request is accepted and processed (dev flag bypasses HMAC)."""
         mock_tenant_graph.return_value = self.mock_graph
         payload = {
             "repository": {"full_name": "Sumit884-byte/sigmaAgent"},
@@ -269,6 +286,121 @@ class BackgroundSyncerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(syncer.last_sync_time)
         mock_sync.assert_called_once_with(graph, "Sumit884-byte/sigmaAgent")
         mock_refresh.assert_called_once_with(graph)
+
+
+class DiscordStreamingTests(unittest.TestCase):
+    def setUp(self):
+        self.graph = MockGraph()
+
+    def test_handle_discord_stream_message_creates_nodes_and_links(self):
+        payload = {
+            "guild_id": "12345",
+            "guild_name": "Acme Corp",
+            "channel_id": "chan-99",
+            "channel_name": "engineering",
+            "message_id": "msg-101",
+            "author_id": "user-55",
+            "author_name": "Priya",
+            "content": "Hey team, I started working on T1 Auth Service today!",
+            "source_url": "https://discord.com/channels/12345/chan-99/msg-101",
+        }
+        res = handle_discord_stream_message(self.graph, payload)
+        self.assertEqual(res["status"], "streamed")
+        self.assertEqual(res["message_id"], "msg-101")
+        self.assertIn("T1", res["mentioned_tasks"])
+
+        queries_text = " ".join(q for q, _ in self.graph.queries)
+        self.assertIn("DiscordChannel", queries_text)
+        self.assertIn("DiscordMessage", queries_text)
+        self.assertIn("DiscordAuthor", queries_text)
+        self.assertIn("MENTIONS", queries_text)
+
+    def test_handle_discord_message_edit(self):
+        res = handle_discord_message_edit(self.graph, "msg-101", "Actually I am working on T2 Billing API now.")
+        self.assertEqual(res["status"], "updated")
+        self.assertIn("T2", res["mentioned_tasks"])
+
+    def test_handle_discord_message_delete_soft_and_hard(self):
+        res_soft = handle_discord_message_delete(self.graph, "msg-101", soft_delete=True)
+        self.assertEqual(res_soft["status"], "soft_deleted")
+
+        res_hard = handle_discord_message_delete(self.graph, "msg-101", soft_delete=False)
+        self.assertEqual(res_hard["status"], "deleted")
+
+
+class GarbageCollectionTests(unittest.TestCase):
+    def setUp(self):
+        self.graph = MockGraph()
+
+    def test_prune_graph_garbage_runs_all_checks(self):
+        stats = prune_graph_garbage(self.graph, max_message_age_days=30)
+        self.assertIn("pruned_doc_sections", stats)
+        self.assertIn("pruned_files", stats)
+        self.assertIn("pruned_topics", stats)
+        self.assertIn("pruned_deleted_messages", stats)
+        self.assertIn("pruned_expired_messages", stats)
+        self.assertIn("total_pruned", stats)
+
+
+class SyncerGCTests(unittest.IsolatedAsyncioTestCase):
+    async def test_syncer_runs_gc(self):
+        graph = MockGraph()
+        syncer = BackgroundKnowledgeSyncer(
+            graph_provider=lambda: graph,
+            default_repo="Sumit884-byte/sigmaAgent",
+            interval_seconds=0,
+        )
+        res = await syncer.run_gc(max_message_age_days=14)
+        self.assertEqual(res["status"], "success")
+        self.assertEqual(syncer.total_gc_count, 1)
+        self.assertIsNotNone(syncer.last_gc_time)
+
+
+class DiscordAndGCApiTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app)
+        self.mock_graph = MockGraph()
+
+    def test_stream_message_endpoint(self):
+        with patch.object(api, "tenant_graph", return_value=self.mock_graph):
+            payload = {
+                "guild_id": "12345",
+                "channel_id": "chan-1",
+                "message_id": "msg-888",
+                "author_id": "dev-1",
+                "author_name": "Sam",
+                "content": "Check T1 and T2",
+            }
+            res = self.client.post("/discord/stream-message", json=payload)
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(res.json()["status"], "streamed")
+
+    def test_stream_message_edit_and_delete_endpoints(self):
+        with patch.object(api, "tenant_graph", return_value=self.mock_graph):
+            res_edit = self.client.put("/discord/stream-message/msg-888", json={"content": "new text"})
+            self.assertEqual(res_edit.status_code, 200)
+            self.assertEqual(res_edit.json()["status"], "updated")
+
+            res_del = self.client.delete("/discord/stream-message/msg-888")
+            self.assertEqual(res_del.status_code, 200)
+            self.assertEqual(res_del.json()["status"], "soft_deleted")
+
+    def test_gc_endpoint_and_status(self):
+        with patch.object(api, "tenant_graph", return_value=self.mock_graph):
+            res = self.client.post("/knowledge/gc", json={"max_message_age_days": 60})
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(res.json()["status"], "success")
+            self.assertIn("stats", res.json())
+
+            res_status = self.client.get("/knowledge/gc/status")
+            self.assertEqual(res_status.status_code, 200)
+            self.assertGreaterEqual(res_status.json()["total_gc_count"], 1)
+
+    def test_run_gc_chat_command(self):
+        with patch.object(api, "tenant_graph", return_value=self.mock_graph):
+            res = self.client.post("/investigate", json={"question": "run gc", "discord": {"guild_id": "12345"}})
+            self.assertEqual(res.status_code, 200)
+            self.assertIn("Graph Garbage Collection complete", res.json()["answer"])
 
 
 if __name__ == "__main__":

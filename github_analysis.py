@@ -29,6 +29,7 @@ COMMON_NON_REPOS = {
     "frontend/backend", "backend/frontend", "client/server", "server/client",
     "ci/cd", "cd/ci", "input/output", "read/write", "and/or", "true/false",
     "before/after", "left/right", "top/bottom", "up/down", "yes/no",
+    "platform/web", "web/platform",
 }
 
 
@@ -155,14 +156,30 @@ def extract_repo(question: str) -> str | None:
         if is_safe_repo(candidate):
             return candidate
 
-    # Look for explicit repo: owner/repo, repository owner/repo, in/for/to owner/repo
+    # Look for explicit repo: repo: owner/repo, repository: owner/repo
     explicit_match = re.search(
-        r"(?:repo|repository|in|for|to)\s*[:=]?\s*([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_][A-Za-z0-9_.-]{0,99})\b",
+        r"(?:repo|repository)\s*[:=]?\s*([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_][A-Za-z0-9_.-]{0,99})\b",
         question or "",
         re.IGNORECASE,
     )
     if explicit_match:
         candidate = f"{explicit_match.group(1)}/{explicit_match.group(2).rstrip('.,;:!?)]}')}"
+        if is_safe_repo(candidate):
+            return candidate
+
+    # Match in/for/to owner/repo only when the question has clear GitHub query intent
+    # (e.g. issues, bugs, PRs, commits, contributors, compare) so that plain task messages like
+    # "assign to Alice for platform/web" or "explain platform/web" are never misread as repos
+    in_match = re.search(
+        r"(?:in|for|to)\s+([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_][A-Za-z0-9_.-]{0,99})\b",
+        question or "",
+        re.IGNORECASE,
+    )
+    if in_match and (
+        GITHUB_QUERY_INTENT.search(question or "")
+        or bool(re.search(r"\b(?:compare|showdown|competition|vs\.?|versus|contributors?|commits?|issues?|bugs?|prs?)\b", question or "", re.IGNORECASE))
+    ):
+        candidate = f"{in_match.group(1)}/{in_match.group(2).rstrip('.,;:!?)]}')}"
         if is_safe_repo(candidate):
             return candidate
 

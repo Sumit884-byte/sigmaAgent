@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import tempfile
@@ -19,6 +20,12 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 INVESTIGATION_API_URL = os.getenv("INVESTIGATION_API_URL")
 INVESTIGATION_API_KEY = os.getenv("INVESTIGATION_API_KEY", "")
 API_TIMEOUT_SECONDS = float(os.getenv("API_TIMEOUT_SECONDS", "45"))
+DISCORD_STREAM_URL = os.getenv(
+    "DISCORD_STREAM_URL",
+    INVESTIGATION_API_URL.replace("/investigate", "/discord/stream-message")
+    if INVESTIGATION_API_URL
+    else "",
+)
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN in your .env file.")
@@ -91,6 +98,63 @@ async def investigate(question: str, message: discord.Message) -> str:
         return extract_answer(data)
 
 
+async def stream_message_to_graph(message: discord.Message) -> None:
+    """Asynchronously stream a Discord message to the company brain graph in real time."""
+    if not DISCORD_STREAM_URL or message.author.bot:
+        return
+    payload = {
+        "guild_id": str(message.guild.id) if message.guild else None,
+        "guild_name": message.guild.name if message.guild else "",
+        "channel_id": str(message.channel.id),
+        "channel_name": getattr(message.channel, "name", "direct"),
+        "message_id": str(message.id),
+        "author_id": str(message.author.id),
+        "author_name": str(message.author),
+        "content": message.content,
+        "timestamp": message.created_at.isoformat(),
+        "source_url": message.jump_url,
+    }
+    headers = {"Content-Type": "application/json"}
+    if INVESTIGATION_API_KEY:
+        headers["Authorization"] = f"Bearer {INVESTIGATION_API_KEY}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            await http.post(DISCORD_STREAM_URL, json=payload, headers=headers)
+    except Exception as exc:
+        log.debug("Real-time stream failed for message %s: %s", message.id, exc)
+
+
+async def stream_message_edit_to_graph(message_id: str, content: str, guild_id: str | None = None) -> None:
+    """Stream a message edit to the company brain graph."""
+    if not DISCORD_STREAM_URL:
+        return
+    edit_url = f"{DISCORD_STREAM_URL.rstrip('/')}/{message_id}"
+    payload = {"content": content, "guild_id": guild_id}
+    headers = {"Content-Type": "application/json"}
+    if INVESTIGATION_API_KEY:
+        headers["Authorization"] = f"Bearer {INVESTIGATION_API_KEY}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            await http.put(edit_url, json=payload, headers=headers)
+    except Exception as exc:
+        log.debug("Real-time stream edit failed for message %s: %s", message_id, exc)
+
+
+async def stream_message_delete_to_graph(message_id: str, guild_id: str | None = None) -> None:
+    """Stream a message deletion to the company brain graph."""
+    if not DISCORD_STREAM_URL:
+        return
+    delete_url = f"{DISCORD_STREAM_URL.rstrip('/')}/{message_id}"
+    headers = {"Content-Type": "application/json"}
+    if INVESTIGATION_API_KEY:
+        headers["Authorization"] = f"Bearer {INVESTIGATION_API_KEY}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            await http.delete(delete_url, params={"guild_id": guild_id} if guild_id else None, headers=headers)
+    except Exception as exc:
+        log.debug("Real-time stream delete failed for message %s: %s", message_id, exc)
+
+
 async def send_long_message(channel: discord.abc.Messageable, text: str) -> None:
     # Discord messages have a 2,000-character limit.
     text = text.strip() or "The investigation API returned no answer."
@@ -107,6 +171,9 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    # Real-time message streaming: keep the company brain graph continuously current
+    asyncio.create_task(stream_message_to_graph(message))
 
     # Only respond when mentioned; avoids replying to every channel message.
     # Discord's autocomplete offers both the bot user and its same-named managed role,
@@ -153,6 +220,24 @@ async def on_message(message: discord.Message):
                 "Something went wrong while investigating. Check the bot logs for details.",
                 mention_author=False,
             )
+
+
+@client.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    """Keep the graph current when a user edits their Discord message."""
+    data = payload.data or {}
+    new_content = data.get("content")
+    if new_content and payload.message_id:
+        guild_id = str(payload.guild_id) if payload.guild_id else None
+        asyncio.create_task(stream_message_edit_to_graph(str(payload.message_id), new_content, guild_id))
+
+
+@client.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    """Keep the graph current when a user deletes their Discord message."""
+    if payload.message_id:
+        guild_id = str(payload.guild_id) if payload.guild_id else None
+        asyncio.create_task(stream_message_delete_to_graph(str(payload.message_id), guild_id))
 
 
 def _acquire_single_instance_lock() -> None:

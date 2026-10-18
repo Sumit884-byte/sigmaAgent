@@ -3,7 +3,9 @@ import re
 import hashlib
 import json
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Any
 
 import httpx
 from dotenv import load_dotenv
@@ -14,7 +16,15 @@ from google.genai import errors as genai_errors
 from pydantic import BaseModel
 
 import continuous_sync
-from continuous_sync import BackgroundKnowledgeSyncer, handle_github_webhook, verify_github_signature
+from continuous_sync import (
+    BackgroundKnowledgeSyncer,
+    handle_discord_message_delete,
+    handle_discord_message_edit,
+    handle_discord_stream_message,
+    handle_github_webhook,
+    prune_graph_garbage,
+    verify_github_signature,
+)
 import knowledge
 from github_analysis import (
     GitHubNotFound,
@@ -35,7 +45,6 @@ def _gemini_client():
     key = os.getenv("GEMINI_API_KEY")
     return genai.Client(api_key=key) if key else None
 
-app = FastAPI(title="Sigma Agent API")
 
 # 1. Database Credentials
 CLOUD_HOST = os.getenv("FALKORDB_HOST", "r-6jissuruar.instance-gijzjhvh6.hc-7up0crkyn.ap-south-1.aws.f2e0a955bb84.cloud")
@@ -69,6 +78,33 @@ def tenant_graph(guild_id):
         knowledge.ensure_indexes(graph)
         _tenant_graphs[name] = graph
     return _tenant_graphs[name]
+
+
+GITHUB_REPO = os.getenv("GITHUB_REPO", "Sumit884-byte/sigmaAgent")
+
+
+def _default_graph_provider():
+    guild_id = os.getenv("DISCORD_GUILD_ID", "1")
+    try:
+        return tenant_graph(guild_id)
+    except Exception:
+        return None
+
+
+background_syncer = BackgroundKnowledgeSyncer(
+    graph_provider=_default_graph_provider,
+    default_repo=GITHUB_REPO,
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    background_syncer.start()
+    yield
+    background_syncer.stop()
+
+
+app = FastAPI(title="Sigma Agent API", lifespan=lifespan)
 
 
 # 3. Create the API Endpoint
@@ -163,8 +199,9 @@ class KnowledgeSyncRequest(BaseModel):
 
 
 @app.post("/knowledge/sync")
-def knowledge_sync(req: KnowledgeSyncRequest):
+def knowledge_sync(req: KnowledgeSyncRequest, request: Request):
     """Pull a GitHub repo's commits, issues/PRs and Markdown docs into one server's graph."""
+    _verify_internal_api_key(request)
     try:
         graph = tenant_graph(req.guild_id)
         return knowledge.sync_repository(graph, req.repo or GITHUB_REPO, max_commits=req.max_commits)
@@ -174,28 +211,38 @@ def knowledge_sync(req: KnowledgeSyncRequest):
         raise _github_http_error(exc) from exc
 
 
-def _default_graph_provider():
-    guild_id = os.getenv("DISCORD_GUILD_ID", "1")
+def _verify_internal_api_key(request: Request) -> None:
+    expected_key = os.getenv("INVESTIGATION_API_KEY", "").strip()
+    if not expected_key:
+        return
+    auth_header = request.headers.get("Authorization") or ""
+    api_key_header = request.headers.get("X-API-Key") or ""
+    token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else auth_header.strip()
+    if token != expected_key and api_key_header != expected_key:
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing API key")
+
+
+def _resolve_guild_for_repo(repo: str, request: Request | None = None) -> str:
+    """Map a repository to its Discord guild on the backend rather than trusting unverified caller headers."""
+    repo_map_raw = os.getenv("REPO_TO_GUILD_MAP", "{}").strip() or "{}"
     try:
-        return tenant_graph(guild_id)
+        repo_map = json.loads(repo_map_raw)
+        if isinstance(repo_map, dict) and repo in repo_map:
+            return str(repo_map[repo])
     except Exception:
-        return None
+        pass
 
+    default_guild = os.getenv("DISCORD_GUILD_ID")
+    if default_guild:
+        return str(default_guild)
 
-background_syncer = BackgroundKnowledgeSyncer(
-    graph_provider=_default_graph_provider,
-    default_repo=GITHUB_REPO,
-)
+    if os.getenv("ALLOW_INSECURE_WEBHOOKS", "").lower() in ("true", "1", "yes"):
+        if request:
+            custom = request.headers.get("X-Discord-Guild-ID") or request.query_params.get("guild_id")
+            if custom:
+                return str(custom)
 
-
-@app.on_event("startup")
-def _start_background_syncer():
-    background_syncer.start()
-
-
-@app.on_event("shutdown")
-def _stop_background_syncer():
-    background_syncer.stop()
+    return "1"
 
 
 @app.post("/webhooks/github")
@@ -216,11 +263,9 @@ async def github_webhook(request: Request):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Malformed JSON payload: {exc}") from exc
 
-    guild_id = (
-        request.headers.get("X-Discord-Guild-ID")
-        or request.query_params.get("guild_id")
-        or os.getenv("DISCORD_GUILD_ID", "1")
-    )
+    repo_data = payload.get("repository") or {}
+    repo = repo_data.get("full_name") or ""
+    guild_id = _resolve_guild_for_repo(repo, request)
     try:
         graph = tenant_graph(guild_id)
     except Exception as exc:
@@ -243,9 +288,111 @@ def knowledge_sync_status():
 
 
 @app.post("/knowledge/sync/run-now")
-async def knowledge_sync_run_now():
+async def knowledge_sync_run_now(request: Request):
     """Trigger an immediate background synchronization cycle across configured repositories."""
+    _verify_internal_api_key(request)
     return await background_syncer.sync_now()
+
+
+class DiscordStreamMessageRequest(BaseModel):
+    guild_id: str | None = None
+    guild_name: str | None = None
+    channel_id: str
+    channel_name: str | None = None
+    message_id: str
+    author_id: str
+    author_name: str
+    content: str
+    timestamp: str | None = None
+    source_url: str | None = None
+
+
+class DiscordMessageEditRequest(BaseModel):
+    content: str
+    edited_at: str | None = None
+    guild_id: str | None = None
+
+
+class GraphGCRequest(BaseModel):
+    guild_id: str | None = None
+    max_message_age_days: int | None = None
+    prune_orphan_docsections: bool = True
+    prune_orphan_files: bool = True
+    prune_orphan_topics: bool = True
+    prune_deleted_messages: bool = True
+
+
+@app.post("/discord/stream-message")
+def discord_stream_message(req: DiscordStreamMessageRequest):
+    """Ingest a live Discord message into the server's graph in real time."""
+    guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "1")
+    try:
+        graph = tenant_graph(guild_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid target graph: {exc}") from exc
+
+    payload = req.model_dump()
+    result = handle_discord_stream_message(graph, payload)
+    background_syncer.streamed_messages_count += 1
+    return result
+
+
+@app.put("/discord/stream-message/{message_id}")
+def discord_stream_message_edit(message_id: str, req: DiscordMessageEditRequest):
+    """Update a live Discord message's content in the server's graph in real time."""
+    guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "1")
+    try:
+        graph = tenant_graph(guild_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid target graph: {exc}") from exc
+
+    return handle_discord_message_edit(graph, message_id, req.content, req.edited_at)
+
+
+@app.delete("/discord/stream-message/{message_id}")
+def discord_stream_message_delete(message_id: str, guild_id: str | None = None, soft_delete: bool = True):
+    """Delete or soft-delete a Discord message in the server's graph."""
+    gid = guild_id or os.getenv("DISCORD_GUILD_ID", "1")
+    try:
+        graph = tenant_graph(gid)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid target graph: {exc}") from exc
+
+    return handle_discord_message_delete(graph, message_id, soft_delete=soft_delete)
+
+
+@app.post("/knowledge/gc")
+def knowledge_gc(req: GraphGCRequest | None = None):
+    """Run graph garbage collection to prune disconnected sections, files, topics, and stale messages."""
+    req = req or GraphGCRequest()
+    guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "1")
+    try:
+        graph = tenant_graph(guild_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid target graph: {exc}") from exc
+
+    stats = prune_graph_garbage(
+        graph,
+        max_message_age_days=req.max_message_age_days,
+        prune_orphan_docsections=req.prune_orphan_docsections,
+        prune_orphan_files=req.prune_orphan_files,
+        prune_orphan_topics=req.prune_orphan_topics,
+        prune_deleted_messages=req.prune_deleted_messages,
+    )
+    background_syncer.total_gc_count += 1
+    background_syncer.last_gc_time = datetime.now(timezone.utc).isoformat()
+    background_syncer.last_gc_result = stats
+    return {"status": "success", "guild_id": guild_id, "stats": stats}
+
+
+@app.get("/knowledge/gc/status")
+def knowledge_gc_status():
+    """Get the latest garbage collection metrics."""
+    return {
+        "total_gc_count": background_syncer.total_gc_count,
+        "last_gc_time": background_syncer.last_gc_time,
+        "last_gc_result": background_syncer.last_gc_result,
+    }
 
 
 
@@ -540,6 +687,10 @@ SYNC_RE = re.compile(
     r"^\s*sync\s+(?:github|repo|knowledge|docs)(?:\s+(?:repo\s+)?(?P<repo>[A-Za-z0-9][\w-]*/[\w.-]+))?\s*[.!]*\s*$",
     re.IGNORECASE,
 )
+GC_RE = re.compile(
+    r"^\s*(?:run\s+gc|garbage\s+collect(?:ion)?|prune\s+graph|clean\s+graph|clean\s+stale\s+knowledge)\s*[?!.]*\s*$",
+    re.IGNORECASE,
+)
 PEOPLE_STATEMENT_RE = re.compile(
     r"\b(?:is|are|'s)\s+[^.?!\n]{1,40}?\s+on\s+github\b|\bgithub\s+(?:user(?:name)?|handle|account|login|id)\b|"
     r"\bgithub\s+(?:is|=|:)\s*@?[A-Za-z0-9-]+|\bon\s+github\s+as\s+@?[A-Za-z0-9-]+|"
@@ -641,6 +792,24 @@ def _sync_answer(question, guild_id):
     if counts["warnings"]:
         answer += "\nNote: " + "; ".join(counts["warnings"][:3])
     return answer
+
+
+def _gc_answer(question, guild_id):
+    if not GC_RE.match(question):
+        return None
+    graph = tenant_graph(guild_id)
+    stats = prune_graph_garbage(graph)
+    background_syncer.total_gc_count += 1
+    background_syncer.last_gc_time = datetime.now(timezone.utc).isoformat()
+    background_syncer.last_gc_result = stats
+    return (
+        f"**Graph Garbage Collection complete:**\n"
+        f"- Pruned orphan doc sections: {stats['pruned_doc_sections']}\n"
+        f"- Pruned orphan files: {stats['pruned_files']}\n"
+        f"- Pruned unreferenced topics: {stats['pruned_topics']}\n"
+        f"- Pruned deleted messages: {stats['pruned_deleted_messages']}\n"
+        f"- Total elements cleaned: {stats['total_pruned']}"
+    )
 
 
 DEPENDENCY_PATH_QUERY = """
@@ -1442,16 +1611,40 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
     return response.parsed
 
 
+NON_DEV_PHRASES = {
+    "next sprint", "this sprint", "sprint", "tomorrow", "today", "yesterday",
+    "v1", "v2", "mvp", "production", "staging", "testing", "review",
+    "frontend", "backend", "database", "api", "mobile", "ios", "android",
+    "release", "deployment", "demo", "hackathon",
+}
+
+
+def _clean_developer_name(dev: str | None, graph: Any) -> str | None:
+    if not dev:
+        return None
+    cleaned = dev.strip().strip("\"'`")
+    if not cleaned or cleaned.casefold() in NON_DEV_PHRASES:
+        return None
+    known = {row[0].casefold(): row[0] for row in graph.ro_query("MATCH (d:Developer) RETURN d.name").result_set}
+    if cleaned.casefold() in known:
+        return known[cleaned.casefold()]
+    if re.search(r"\b(?:and|or|for|with|in|on|at|by|to|is|will|should|next|this|last)\b", cleaned, re.IGNORECASE):
+        return None
+    if len(cleaned.split()) > 3:
+        return None
+    return cleaned
+
+
 DIRECT_CREATE_TASK_RE = re.compile(
     r"^\s*(?:create|add|new)\s+task\s+(?P<title>.+?)(?:\s+(?:for|assigned to)\s+(?P<dev>[A-Za-z0-9_ -]+))?\s*$",
     re.IGNORECASE,
 )
 DIRECT_ASSIGN_RE = re.compile(
-    r"^\s*assign\s+(?P<task>T\d+|[A-Za-z0-9_ -]+?)\s+to\s+(?P<dev>[A-Za-z0-9_ -]+)\s*$",
+    r"^\s*assign\s+(?P<task>T\d+|[A-Za-z0-9_ -]+?)\s+to\s+(?P<dev>[A-Za-z0-9_ -]+)\s*[!.?]*\s*$",
     re.IGNORECASE,
 )
 DIRECT_STATUS_RE = re.compile(
-    r"^\s*(?:mark|set\s+status\s+of)\s+(?P<task>T\d+|[A-Za-z0-9_ -]+?)\s+(?:as\s+|to\s+)?(?P<status>todo|in_progress|done)\s*$",
+    r"^\s*(?:mark|set\s+status\s+of)\s+(?P<task>T\d+|[A-Za-z0-9_ -]+?)\s+(?:as\s+|to\s+)?(?P<status>todo|in\s+progress|in_progress|done|completed|finished)\s*[!.?]*\s*$",
     re.IGNORECASE,
 )
 DIRECT_LIST_TASKS_RE = re.compile(
@@ -1483,7 +1676,15 @@ def _direct_task_command_answer(question, guild_id, discord):
     match = DIRECT_CREATE_TASK_RE.match(question)
     if match:
         title = match.group("title").strip()
-        dev = match.group("dev").strip() if match.group("dev") else None
+        raw_dev = match.group("dev").strip() if match.group("dev") else None
+        graph = tenant_graph(guild_id)
+        dev = _clean_developer_name(raw_dev, graph)
+        if raw_dev and not dev:
+            title = f"{title} for {raw_dev}"
+
+        if not title or len(title) < 2 or title.casefold().startswith("for "):
+            return "Please provide a valid task title to create a task."
+
         change = TaskChange(action="create", title=title, developer=dev)
         try:
             applied_summary = _apply_change(guild_id, change, author, provenance)
@@ -1494,7 +1695,11 @@ def _direct_task_command_answer(question, guild_id, discord):
     match = DIRECT_ASSIGN_RE.match(question)
     if match:
         task_ref = match.group("task").strip()
-        dev = match.group("dev").strip()
+        raw_dev = match.group("dev").strip()
+        graph = tenant_graph(guild_id)
+        dev = _clean_developer_name(raw_dev, graph)
+        if not dev:
+            return f"I couldn't identify '{raw_dev}' as a developer. Please name a person to assign to."
         task_id = _resolve_task(guild_id, task_ref)
         if not task_id:
             return f"I couldn't find a task matching '{task_ref}'."
@@ -1508,7 +1713,13 @@ def _direct_task_command_answer(question, guild_id, discord):
     match = DIRECT_STATUS_RE.match(question)
     if match:
         task_ref = match.group("task").strip()
-        status_val = match.group("status").strip().lower().replace(" ", "_")
+        raw_status = match.group("status").strip().lower()
+        if raw_status in ("completed", "finished", "done"):
+            status_val = "done"
+        elif raw_status in ("in progress", "in_progress"):
+            status_val = "in_progress"
+        else:
+            status_val = "todo"
         task_id = _resolve_task(guild_id, task_ref)
         if not task_id:
             return f"I couldn't find a task matching '{task_ref}'."
@@ -1531,7 +1742,7 @@ def investigate(req: InvestigateRequest):
     # Requests from outside Discord (e.g. curl) use the default server
     server_id = discord.get("guild_id") if req.discord else os.getenv("DISCORD_GUILD_ID")
     if server_id:
-        for command in (_sync_answer, _teams_answer):
+        for command in (_sync_answer, _teams_answer, _gc_answer):
             command_answer = command(req.question, server_id)
             if command_answer is not None:
                 return {"answer": command_answer}
