@@ -519,7 +519,7 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 </p>
 
 <p align="center">
-  <sub>Built with ❤️ by <a href="https://github.com/Sumit884-byte">Sumit Mishra</a> · <a href="https://github.com/kawaresrishti">Srushti Kaware</a> · <a href="https://github.com/soma0212">Soma Datta</a> · <a href="https://github.com/gitseraj12">Seraj</a></sub><br />
+  <sub>Built with ❤️ by <a href="https://github.com/Sumit884-byte">Sumit Mishra</a> · <a href="https://github.com/kawaresrishti">Srushti Kaware</a> · <a href="https://github.com/soma1111111">Soma Datta</a> · <a href="https://github.com/gitseraj12">Seraj</a></sub><br />
   <sub>Powered by <b>FalkorDB</b> · <b>Gemini AI</b> · <b>FastAPI</b> · <b>Discord.py</b></sub>
 </p>
 
