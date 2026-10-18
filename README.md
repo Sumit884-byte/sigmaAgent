@@ -476,7 +476,6 @@ Contributions are welcome! Here's how to get started:
 
 ## AI Disclosure
 
-**What the team is responsible for:**
 The team understood, reviewed, and owned every line of code, architectural choice, graph schema design, and the overall system concept.
 AI tools were used to accelerate development, not to replace engineering judgment. All team members can explain what was built and why.
 
