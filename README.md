@@ -474,7 +474,7 @@ Contributions are welcome! Here's how to get started:
 ---
 <br />
 
-🤖 AI Disclosure
+## AI Disclosure
 
 This project was built with the assistance of AI coding tools.
 
