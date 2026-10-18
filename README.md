@@ -472,6 +472,20 @@ Contributions are welcome! Here's how to get started:
 <br />
 
 ---
+<br />
+## 🤖 AI Disclosure
+
+This project was built with the assistance of AI coding tools.
+
+| Area | AI Assistance Used |
+|:-----|:-------------------|
+| **Code generation** | Claude (Anthropic) assisted with boilerplate, regex patterns, Cypher query construction, and test scaffolding |
+| **PR review & debugging** | Claude was used to review pull requests, identify edge cases, and suggest fixes (e.g. PR #15 structured source extraction) |
+| **Documentation** | This README and inline docstrings were drafted and refined with AI assistance |
+| **Architecture decisions** | Core architecture — graph schema, zero-token routing, multi-tenant isolation — **was designed and validated by the team**; AI assisted with implementation details |
+
+**What the team is responsible for:**
+Every line of code, architectural choice, graph schema design, and the overall system concept was understood, reviewed, and owned by the team. AI tools were used to accelerate development, not to replace engineering judgment. All team members can explain what was built and why.
 
 <br />
 
