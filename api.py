@@ -1476,6 +1476,9 @@ def _direct_task_command_answer(question, guild_id, discord):
 
     provenance = _discord_provenance(discord, guild_id, question)
     author = (discord or {}).get("author_name") or "someone"
+    if provenance is None:
+        # No valid Discord source — let the Gemini path handle it with a consistent error message
+        return None
 
     match = DIRECT_CREATE_TASK_RE.match(question)
     if match:
@@ -1492,7 +1495,7 @@ def _direct_task_command_answer(question, guild_id, discord):
     if match:
         task_ref = match.group("task").strip()
         dev = match.group("dev").strip()
-        task_id = _resolve_task_reference(guild_id, task_ref)
+        task_id = _resolve_task(guild_id, task_ref)
         if not task_id:
             return f"I couldn't find a task matching '{task_ref}'."
         change = TaskChange(action="assign", task_id=task_id, developer=dev)
@@ -1506,7 +1509,7 @@ def _direct_task_command_answer(question, guild_id, discord):
     if match:
         task_ref = match.group("task").strip()
         status_val = match.group("status").strip().lower().replace(" ", "_")
-        task_id = _resolve_task_reference(guild_id, task_ref)
+        task_id = _resolve_task(guild_id, task_ref)
         if not task_id:
             return f"I couldn't find a task matching '{task_ref}'."
         change = TaskChange(action="set_status", task_id=task_id, status=status_val)
