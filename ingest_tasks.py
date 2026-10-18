@@ -7,10 +7,10 @@ from falkordb import FalkorDB
 load_dotenv()
 
 # 1. Database Credentials
-CLOUD_HOST = os.getenv("FALKORDB_HOST", "r-6jissuruar.instance-gijzjhvh6.hc-7up0crkyn.ap-south-1.aws.f2e0a955bb84.cloud")
-CLOUD_PORT = int(os.getenv("FALKORDB_PORT", 52078))
-CLOUD_USERNAME = os.getenv("FALKORDB_USERNAME", "falkordb")
-CLOUD_PASSWORD = os.getenv("FALKORDB_PASSWORD", "password")
+CLOUD_HOST = os.getenv("FALKORDB_HOST", "localhost")
+CLOUD_PORT = int(os.getenv("FALKORDB_PORT", "6379"))
+CLOUD_USERNAME = os.getenv("FALKORDB_USERNAME", "")
+CLOUD_PASSWORD = os.getenv("FALKORDB_PASSWORD", "")
 
 # 2. Connect to database
 db = FalkorDB(host=CLOUD_HOST, port=CLOUD_PORT, username=CLOUD_USERNAME, password=CLOUD_PASSWORD)

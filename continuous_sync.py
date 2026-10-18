@@ -9,12 +9,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import importlib.util
 import logging
 import os
 import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-import sys
 from typing import Any, Callable
 
 import httpx
@@ -22,14 +22,36 @@ import httpx
 import knowledge
 from github_analysis import GitHubNotFound, GitHubUnavailable, is_safe_repo
 
-_CR_DIR = Path(__file__).resolve().parent / "context retrieval"
-if str(_CR_DIR) not in sys.path:
-    sys.path.insert(0, str(_CR_DIR))
+
+def _load_context_retrieval_module(name: str, relative_path: str):
+    """Load a module from context retrieval/ by file path without touching sys.path.
+
+    This prevents 'context retrieval/api.py' from shadowing the root 'api.py'
+    when continuous_sync is imported before api in a test environment.
+    """
+    cr_dir = Path(__file__).resolve().parent / "context retrieval"
+    module_path = cr_dir / relative_path
+    if not module_path.exists():
+        raise ImportError(f"context retrieval module not found: {module_path}")
+    spec = importlib.util.spec_from_file_location(f"_cr_{name}", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot create spec for {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
 
 try:
-    from models import DiscordMessage  # type: ignore
-    from graph_store import import_messages  # type: ignore
-except ImportError:
+    _models_mod = _load_context_retrieval_module("models", "models.py")
+    _graph_store_mod = _load_context_retrieval_module("graph_store", "graph_store.py")
+    DiscordMessage = _models_mod.DiscordMessage
+    import_messages = _graph_store_mod.import_messages
+except ImportError as _cr_import_err:
+    import warnings
+    warnings.warn(
+        f"context retrieval pipeline unavailable — evidence extraction disabled: {_cr_import_err}",
+        stacklevel=1,
+    )
     DiscordMessage = None  # type: ignore
     import_messages = None  # type: ignore
 
@@ -88,13 +110,8 @@ def handle_github_webhook(graph: Any, event_name: str, payload: dict[str, Any]) 
     )
 
     tasks = [(row[0], row[1]) for row in graph.ro_query("MATCH (t:Task) RETURN t.id, t.title").result_set]
-    if not tasks:
-        log.info("Graph has no tasks; skipping full webhook processing for %s", repo)
-        return {
-            "status": "skipped",
-            "reason": "graph holds no tasks for repository linkage",
-            "repo": repo,
-        }
+    # Note: tasks may be empty. Do NOT early-return — commits, docs, and issues are valuable
+    # company brain knowledge regardless of whether tasks currently exist. Only skip task-linking.
 
     developers = [row[0] for row in graph.ro_query("MATCH (d:Developer) RETURN d.name").result_set]
 
@@ -444,6 +461,7 @@ def prune_graph_garbage(
         "pruned_files": 0,
         "pruned_topics": 0,
         "pruned_deleted_messages": 0,
+        "pruned_orphan_evidence": 0,
         "pruned_expired_messages": 0,
         "total_pruned": 0,
     }
@@ -452,55 +470,67 @@ def prune_graph_garbage(
     if prune_orphan_docsections:
         res = graph.query(
             "MATCH (sec:DocSection) WHERE NOT ()-[:HAS_SECTION]->(sec) "
-            "WITH sec, count(sec) AS cnt DETACH DELETE sec RETURN cnt"
+            "WITH count(sec) AS cnt DELETE sec RETURN cnt"
         )
-        count = sum(row[0] for row in res.result_set) if res.result_set else 0
-        stats["pruned_doc_sections"] = count
+        stats["pruned_doc_sections"] = res.result_set[0][0] if res.result_set else 0
 
     # 2. Orphan Files (files with no touching commits)
     if prune_orphan_files:
         res = graph.query(
             "MATCH (f:File) WHERE NOT ()-[:TOUCHES]->(f) "
-            "WITH f, count(f) AS cnt DETACH DELETE f RETURN cnt"
+            "WITH count(f) AS cnt DELETE f RETURN cnt"
         )
-        count = sum(row[0] for row in res.result_set) if res.result_set else 0
-        stats["pruned_files"] = count
+        stats["pruned_files"] = res.result_set[0][0] if res.result_set else 0
 
     # 3. Orphan Topics (topics with no expert links)
     if prune_orphan_topics:
         res = graph.query(
             "MATCH (top:Topic) WHERE NOT ()-[:EXPERT_IN]->(top) "
-            "WITH top, count(top) AS cnt DETACH DELETE top RETURN cnt"
+            "WITH count(top) AS cnt DELETE top RETURN cnt"
         )
-        count = sum(row[0] for row in res.result_set) if res.result_set else 0
-        stats["pruned_topics"] = count
+        stats["pruned_topics"] = res.result_set[0][0] if res.result_set else 0
 
-    # 4. Soft-deleted messages and orphan evidence
+    # 4. Soft-deleted messages — delete evidence together with message atomically
     if prune_deleted_messages:
-        res_e = graph.query(
-            "MATCH (e:ContextEvidence) WHERE NOT ()-[:SUPPORTS]->(e) "
-            "WITH e, count(e) AS cnt DETACH DELETE e RETURN cnt"
-        )
-        orphan_ev = sum(row[0] for row in res_e.result_set) if res_e.result_set else 0
-
         res = graph.query(
             "MATCH (m:DiscordMessage) WHERE m.is_deleted = true "
             "OPTIONAL MATCH (m)-[:SUPPORTS]->(e:ContextEvidence) "
-            "WITH m, e, count(m) AS cnt DETACH DELETE e, m RETURN cnt"
+            "WITH count(DISTINCT m) AS msg_cnt, collect(DISTINCT e) AS evs "
+            "FOREACH (e IN evs | DETACH DELETE e) "
+            "RETURN msg_cnt"
         )
-        count = sum(row[0] for row in res.result_set) if res.result_set else 0
-        stats["pruned_deleted_messages"] = count + orphan_ev
+        msg_count = res.result_set[0][0] if res.result_set else 0
+        if msg_count:
+            graph.query(
+                "MATCH (m:DiscordMessage) WHERE m.is_deleted = true DETACH DELETE m"
+            )
+        stats["pruned_deleted_messages"] = msg_count
 
-    # 5. Expired messages by retention period
+    # 5. Expired messages by retention period — delete evidence together with message
     if max_message_age_days and max_message_age_days > 0:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=max_message_age_days)).isoformat()
         res = graph.query(
             "MATCH (m:DiscordMessage) WHERE m.timestamp IS NOT NULL AND m.timestamp < $cutoff "
-            "WITH m, count(m) AS cnt DETACH DELETE m RETURN cnt",
+            "OPTIONAL MATCH (m)-[:SUPPORTS]->(e:ContextEvidence) "
+            "WITH count(DISTINCT m) AS msg_cnt, collect(DISTINCT e) AS evs "
+            "FOREACH (e IN evs | DETACH DELETE e) "
+            "RETURN msg_cnt",
             {"cutoff": cutoff},
         )
-        count = sum(row[0] for row in res.result_set) if res.result_set else 0
-        stats["pruned_expired_messages"] = count
+        msg_count = res.result_set[0][0] if res.result_set else 0
+        if msg_count:
+            graph.query(
+                "MATCH (m:DiscordMessage) WHERE m.timestamp IS NOT NULL AND m.timestamp < $cutoff DETACH DELETE m",
+                {"cutoff": cutoff},
+            )
+        stats["pruned_expired_messages"] = msg_count
+
+    # 6. Orphan evidence — runs AFTER expiry so no evidence text lingers
+    res_oe = graph.query(
+        "MATCH (e:ContextEvidence) WHERE NOT ()-[:SUPPORTS]->(e) "
+        "WITH count(e) AS cnt DETACH DELETE e RETURN cnt"
+    )
+    stats["pruned_orphan_evidence"] = res_oe.result_set[0][0] if res_oe.result_set else 0
 
     stats["total_pruned"] = sum(v for k, v in stats.items() if k != "total_pruned")
     return stats

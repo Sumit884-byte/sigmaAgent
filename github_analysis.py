@@ -487,8 +487,8 @@ def extract_compare_users(text: str) -> list[str]:
         u_clean = u.lstrip("@").strip()
         if not u_clean or u_clean.casefold() in COMPARE_STOP_WORDS:
             return False
-        # Task IDs like T1, T2, T3 are NOT usernames
-        if re.fullmatch(r"T\d+", u_clean, re.IGNORECASE):
+        # Task IDs like T1, T2 and Jira-style ENG-123 are NOT usernames
+        if re.fullmatch(r"(?:[A-Za-z]+-\d+|T\d+)", u_clean, re.IGNORECASE):
             return False
         return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,38}", u_clean))
 
@@ -633,8 +633,8 @@ TASK_COMMAND_PATTERN = re.compile(
     r"^\s*(?:create\s+task|add\s+task|new\s+task|assign\b|unassign\b|rename\s+task|delete\s+task|set\s+status|explain\b|mark\s+task)\b|"
     r"\bas\s+a\s+(?:new\s+)?task\b|"
     r"\bfor\s+a\s+(?:new\s+)?task\b|"
-    r"\bT\d+\s+(?:is\s+blocked\s+by|is\s+unblocked|depends\s+on|now\s+depends|no\s+longer\s+depends|is\s+done|is\s+in\s+progress|is\s+assigned)\b|"
-    r"\b(?:blocked\s+by|depends\s+on|waiting\s+on)\s+T\d+\b|"
+    r"\b(?:[A-Za-z]+-\d+|T\d+)\s+(?:is\s+blocked\s+by|is\s+unblocked|depends\s+on|now\s+depends|no\s+longer\s+depends|is\s+done|is\s+in\s+progress|is\s+assigned)\b|"
+    r"\b(?:blocked\s+by|depends\s+on|waiting\s+on)\s+(?:[A-Za-z]+-\d+|T\d+)\b|"
     r"\bwho\s+should\s+own\b",
     re.IGNORECASE,
 )

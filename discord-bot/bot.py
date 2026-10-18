@@ -135,9 +135,14 @@ async def stream_message_to_graph(message: discord.Message) -> None:
         headers["Authorization"] = f"Bearer {INVESTIGATION_API_KEY}"
     try:
         async with httpx.AsyncClient(timeout=5.0) as http:
-            await http.post(DISCORD_STREAM_URL, json=payload, headers=headers)
+            resp = await http.post(DISCORD_STREAM_URL, json=payload, headers=headers)
+            if resp.status_code >= 400:
+                log.warning(
+                    "Real-time stream rejected for message %s: HTTP %s %s",
+                    message.id, resp.status_code, resp.text[:200],
+                )
     except Exception as exc:
-        log.debug("Real-time stream failed for message %s: %s", message.id, exc)
+        log.warning("Real-time stream failed for message %s: %s", message.id, exc)
 
 
 async def stream_message_edit_to_graph(message_id: str, content: str, guild_id: str | None = None) -> None:
@@ -151,9 +156,14 @@ async def stream_message_edit_to_graph(message_id: str, content: str, guild_id: 
         headers["Authorization"] = f"Bearer {INVESTIGATION_API_KEY}"
     try:
         async with httpx.AsyncClient(timeout=5.0) as http:
-            await http.put(edit_url, json=payload, headers=headers)
+            resp = await http.put(edit_url, json=payload, headers=headers)
+            if resp.status_code >= 400:
+                log.warning(
+                    "Real-time stream edit rejected for message %s: HTTP %s %s",
+                    message_id, resp.status_code, resp.text[:200],
+                )
     except Exception as exc:
-        log.debug("Real-time stream edit failed for message %s: %s", message_id, exc)
+        log.warning("Real-time stream edit failed for message %s: %s", message_id, exc)
 
 
 async def stream_message_delete_to_graph(message_id: str, guild_id: str | None = None) -> None:
@@ -166,9 +176,14 @@ async def stream_message_delete_to_graph(message_id: str, guild_id: str | None =
         headers["Authorization"] = f"Bearer {INVESTIGATION_API_KEY}"
     try:
         async with httpx.AsyncClient(timeout=5.0) as http:
-            await http.delete(delete_url, params={"guild_id": guild_id} if guild_id else None, headers=headers)
+            resp = await http.delete(delete_url, params={"guild_id": guild_id} if guild_id else None, headers=headers)
+            if resp.status_code >= 400:
+                log.warning(
+                    "Real-time stream delete rejected for message %s: HTTP %s %s",
+                    message_id, resp.status_code, resp.text[:200],
+                )
     except Exception as exc:
-        log.debug("Real-time stream delete failed for message %s: %s", message_id, exc)
+        log.warning("Real-time stream delete failed for message %s: %s", message_id, exc)
 
 
 async def send_long_message(channel: discord.abc.Messageable, text: str) -> None:

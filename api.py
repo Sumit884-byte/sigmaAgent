@@ -161,8 +161,8 @@ GITHUB_REPO = os.getenv("GITHUB_REPO", "Sumit884-byte/sigmaAgent")
 
 def _github_http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, GitHubNotFound):
-        return HTTPException(status_code=404, detail=str(exc))
-    return HTTPException(status_code=503, detail=str(exc))
+        return HTTPException(status_code=404, detail="GitHub repository or issue not found")
+    return HTTPException(status_code=503, detail="GitHub service is currently unavailable")
 
 
 @app.get("/github/contributors")
@@ -228,8 +228,8 @@ def knowledge_sync(req: KnowledgeSyncRequest, request: Request):
     try:
         graph = tenant_graph(req.guild_id)
         return knowledge.sync_repository(graph, req.repo or GITHUB_REPO, max_commits=req.max_commits)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid request parameters") from None
     except (GitHubNotFound, GitHubUnavailable) as exc:
         raise _github_http_error(exc) from exc
 
@@ -361,7 +361,9 @@ class GraphGCRequest(BaseModel):
 def discord_stream_message(req: DiscordStreamMessageRequest, request: Request):
     """Ingest a live Discord message into the server's graph in real time."""
     _verify_internal_api_key(request)
-    guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "1")
+    guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "")
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="guild_id is required when DISCORD_GUILD_ID is not set")
     try:
         graph = tenant_graph(guild_id)
     except Exception as exc:
@@ -377,7 +379,9 @@ def discord_stream_message(req: DiscordStreamMessageRequest, request: Request):
 def discord_stream_message_edit(message_id: str, req: DiscordMessageEditRequest, request: Request):
     """Update a live Discord message's content in the server's graph in real time."""
     _verify_internal_api_key(request)
-    guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "1")
+    guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "")
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="guild_id is required when DISCORD_GUILD_ID is not set")
     try:
         graph = tenant_graph(guild_id)
     except Exception as exc:
@@ -390,7 +394,9 @@ def discord_stream_message_edit(message_id: str, req: DiscordMessageEditRequest,
 def discord_stream_message_delete(message_id: str, request: Request, guild_id: str | None = None, soft_delete: bool = True):
     """Delete or soft-delete a Discord message in the server's graph."""
     _verify_internal_api_key(request)
-    gid = guild_id or os.getenv("DISCORD_GUILD_ID", "1")
+    gid = guild_id or os.getenv("DISCORD_GUILD_ID", "")
+    if not gid:
+        raise HTTPException(status_code=400, detail="guild_id is required when DISCORD_GUILD_ID is not set")
     try:
         graph = tenant_graph(gid)
     except Exception as exc:
@@ -404,7 +410,9 @@ def knowledge_gc(request: Request, req: GraphGCRequest | None = None):
     """Run graph garbage collection to prune disconnected sections, files, topics, and stale messages."""
     _verify_internal_api_key(request)
     req = req or GraphGCRequest()
-    guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "1")
+    guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "")
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="guild_id is required when DISCORD_GUILD_ID is not set")
     try:
         graph = tenant_graph(guild_id)
     except Exception as exc:
@@ -824,8 +832,8 @@ def _sync_answer(question, guild_id):
         counts = knowledge.sync_repository(graph, repo)
     except GitHubNotFound:
         return (f"I couldn't find **{repo}** on GitHub. If it's private, set `GITHUB_TOKEN` in the backend `.env`.")
-    except GitHubUnavailable as exc:
-        return f"I couldn't reach GitHub: {exc}. Nothing was changed."
+    except GitHubUnavailable:
+        return "I couldn't reach GitHub right now. Nothing was changed."
     answer = (f"Synced **{repo}** into this server's graph: {counts['commits']} commits, "
               f"{counts['issues']} issues/PRs, {counts['documents']} docs ({counts['sections']} sections), "
               f"expertise for {counts['topics']} topics. Try `who knows about <topic>` or `experts`.")
@@ -896,7 +904,7 @@ def _explain_dependency_path(question, guild_id, tasks):
 
     task_rows = _aggregate_task_rows(tasks)
     task_matches = [row for row in task_rows if str(row[0]).casefold() == target_ref.casefold()]
-    is_task_id = bool(re.fullmatch(r"T\d+", target_ref, flags=re.IGNORECASE))
+    is_task_id = bool(re.fullmatch(r"(?:[A-Za-z]+-\d+|T\d+)", target_ref, flags=re.IGNORECASE))
     is_quoted_title = raw_ref.startswith(("\"", "'")) and raw_ref[-1:] == raw_ref[:1]
     if not task_matches:
         task_matches = [row for row in task_rows if str(row[1]).casefold() == target_ref.casefold()]
@@ -1009,7 +1017,7 @@ def _ownership_provenance_answer(question, guild_id, tasks):
     lowered = question.casefold()
     if "why" not in lowered or not re.search(r"\b(owner|owned|assign|assigned)\b", lowered):
         return None
-    task_match = re.search(r"\bT\d+\b", question, flags=re.IGNORECASE)
+    task_match = re.search(r"\b(?:[A-Za-z]+-\d+|T\d+)\b", question, flags=re.IGNORECASE)
     grouped_tasks = _aggregate_task_rows(tasks)
     if task_match:
         matches = [row for row in grouped_tasks if row[0].casefold() == task_match.group(0).casefold()]
@@ -1044,7 +1052,7 @@ def _relevant_task_change_context(question, guild_id, tasks):
     if not re.search(r"\bwhy\b", question, flags=re.IGNORECASE):
         return "(no task-change history requested)"
     grouped_tasks = _aggregate_task_rows(tasks)
-    ids = {match.casefold() for match in re.findall(r"\bT\d+\b", question, flags=re.IGNORECASE)}
+    ids = {match.casefold() for match in re.findall(r"\b(?:[A-Za-z]+-\d+|T\d+)\b", question, flags=re.IGNORECASE)}
     matched = [row for row in grouped_tasks if row[0].casefold() in ids]
     if not matched:
         matched = [row for row in grouped_tasks
@@ -1672,11 +1680,11 @@ DIRECT_CREATE_TASK_RE = re.compile(
     re.IGNORECASE,
 )
 DIRECT_ASSIGN_RE = re.compile(
-    r"^\s*assign\s+(?P<task>T\d+|[A-Za-z0-9_ -]+?)\s+to\s+(?P<dev>[A-Za-z0-9_ -]+)\s*[!.?]*\s*$",
+    r"^\s*assign\s+(?P<task>(?:[A-Za-z]+-\d+|T\d+)|[A-Za-z0-9_ -]+?)\s+to\s+(?P<dev>[A-Za-z0-9_ -]+)\s*[!.?]*\s*$",
     re.IGNORECASE,
 )
 DIRECT_STATUS_RE = re.compile(
-    r"^\s*(?:mark|set\s+status\s+of)\s+(?P<task>T\d+|[A-Za-z0-9_ -]+?)\s+(?:as\s+|to\s+)?(?P<status>todo|in\s+progress|in_progress|done|completed|finished)\s*[!.?]*\s*$",
+    r"^\s*(?:mark|set\s+status\s+of)\s+(?P<task>(?:[A-Za-z]+-\d+|T\d+)|[A-Za-z0-9_ -]+?)\s+(?:as\s+|to\s+)?(?P<status>todo|in\s+progress|in_progress|done|completed|finished)\s*[!.?]*\s*$",
     re.IGNORECASE,
 )
 DIRECT_LIST_TASKS_RE = re.compile(
@@ -1840,7 +1848,7 @@ def investigate(req: InvestigateRequest):
                     target = (" ".join(filter(None, [change.developer, change.team, change.github_login]))
                               if change.action in ("join_team", "leave_team", "link_github")
                               else " ".join(filter(None, [change.task_id, change.title])) or "task")
-                    lines.append(f"- Couldn't {change.action.replace('_', ' ')} {target}: {exc}")
+                    lines.append(f"- Couldn't {change.action.replace('_', ' ')} {target}: invalid request or task not found.")
             answer = reply.answer.strip()
             if applied and "?" in req.question:
                 try:

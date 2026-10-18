@@ -402,18 +402,18 @@ class DiscordAndGCApiTests(unittest.TestCase):
 
     def test_stream_message_edit_and_delete_endpoints(self):
         with patch.object(api, "tenant_graph", return_value=self.mock_graph), \
-             patch.dict(os.environ, {"INVESTIGATION_API_KEY": "test-internal-key"}):
-            res_edit = self.client.put("/discord/stream-message/msg-888", json={"content": "new text"}, headers=self.headers)
+             patch.dict(os.environ, {"INVESTIGATION_API_KEY": "test-internal-key", "DISCORD_GUILD_ID": "12345"}):
+            res_edit = self.client.put("/discord/stream-message/msg-888", json={"content": "new text", "guild_id": "12345"}, headers=self.headers)
             self.assertEqual(res_edit.status_code, 200)
             self.assertEqual(res_edit.json()["status"], "updated")
 
-            res_del = self.client.delete("/discord/stream-message/msg-888", headers=self.headers)
+            res_del = self.client.delete("/discord/stream-message/msg-888", params={"guild_id": "12345"}, headers=self.headers)
             self.assertEqual(res_del.status_code, 200)
             self.assertEqual(res_del.json()["status"], "soft_deleted")
 
     def test_gc_endpoint_and_status(self):
         with patch.object(api, "tenant_graph", return_value=self.mock_graph), \
-             patch.dict(os.environ, {"INVESTIGATION_API_KEY": "test-internal-key"}):
+             patch.dict(os.environ, {"INVESTIGATION_API_KEY": "test-internal-key", "DISCORD_GUILD_ID": "12345"}):
             res = self.client.post("/knowledge/gc", json={"max_message_age_days": 60}, headers=self.headers)
             self.assertEqual(res.status_code, 200)
             self.assertEqual(res.json()["status"], "success")
@@ -437,16 +437,30 @@ class DiscordAndGCApiTests(unittest.TestCase):
             self.assertEqual(res.status_code, 400)
             self.assertIn("Repository is not mapped", res.json()["detail"])
 
-    def test_webhook_skips_when_graph_has_no_tasks(self):
+    def test_webhook_stores_commits_when_no_tasks(self):
+        """Commits, docs and issues must be ingested even when the graph has no tasks yet."""
         empty_graph = MockGraph()
         empty_graph.tasks = []
         payload = {
             "repository": {"full_name": "Sumit884-byte/sigmaAgent", "default_branch": "main"},
-            "commits": [{"id": "c1", "message": "feat: init"}],
+            "commits": [{"id": "abc123", "message": "feat: init", "author": {"name": "Dev", "username": "dev"}, "added": [], "modified": [], "removed": []}],
         }
         res = handle_github_webhook(empty_graph, "push", payload)
-        self.assertEqual(res["status"], "skipped")
-        self.assertIn("no tasks", res["reason"])
+        self.assertEqual(res["status"], "processed")
+        self.assertEqual(res["commits_ingested"], 1)
+        commit_upserts = [params for q, params in empty_graph.queries if "MERGE (c:Commit" in q]
+        self.assertEqual(len(commit_upserts), 1)
+
+    def test_stream_without_guild_id_returns_400(self):
+        """Stream endpoint must reject with 400 when guild_id is missing and DISCORD_GUILD_ID is unset."""
+        with patch.dict(os.environ, {"INVESTIGATION_API_KEY": "test-internal-key", "DISCORD_GUILD_ID": ""}):
+            res = self.client.post(
+                "/discord/stream-message",
+                json={"channel_id": "c1", "message_id": "m1", "author_id": "a1", "author_name": "Dev", "content": "hello"},
+                headers=self.headers,
+            )
+            self.assertEqual(res.status_code, 400)
+            self.assertIn("guild_id is required", res.json()["detail"])
 
     def test_developer_mapping_uses_discord_id_only(self):
         # Two users with same name 'Alice' but different discord IDs
