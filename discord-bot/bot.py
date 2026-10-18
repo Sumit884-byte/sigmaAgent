@@ -126,11 +126,8 @@ async def on_message(message: discord.Message):
     question = question.strip()
 
     if not question:
-        await message.reply(
-            "Ask me a project question, for example: `@SigmaAgent Why is checkout delayed?`",
-            mention_author=False,
-        )
-        return
+        # A bare mention shows what the bot can do; the backend owns that list
+        question = "help"
 
     async with message.channel.typing():
         try:
