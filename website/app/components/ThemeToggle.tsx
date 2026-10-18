@@ -1,41 +1,11 @@
-"use client";
-
-import { useEffect } from "react";
-
-type Theme = "dark" | "light";
-
-function applyTheme(theme: Theme) {
-  document.documentElement.dataset.theme = theme;
-  window.localStorage.setItem("sigma-theme", theme);
-}
-
 export default function ThemeToggle() {
-  useEffect(() => {
-    const storedTheme = window.localStorage.getItem("sigma-theme");
-    const initialTheme: Theme = storedTheme === "light" ? "light" : "dark";
-    document.documentElement.dataset.theme = initialTheme;
-
-    const syncTheme = (event: StorageEvent) => {
-      if (event.key !== "sigma-theme") return;
-      const nextTheme: Theme = event.newValue === "light" ? "light" : "dark";
-      document.documentElement.dataset.theme = nextTheme;
-    };
-    window.addEventListener("storage", syncTheme);
-    return () => window.removeEventListener("storage", syncTheme);
-  }, []);
-
-  function toggleTheme() {
-    const nextTheme: Theme = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-    applyTheme(nextTheme);
-  }
-
   return (
     <button
       className="theme-toggle"
       type="button"
-      onClick={toggleTheme}
-      aria-label="Toggle light and dark theme"
-      title="Toggle light and dark theme"
+      aria-label="Switch to light mode"
+      aria-pressed="false"
+      title="Switch to light mode"
     >
       <svg className="theme-sun" viewBox="0 0 24 24" fill="none" aria-hidden="true">
         <circle cx="12" cy="12" r="3.5" />
@@ -44,7 +14,7 @@ export default function ThemeToggle() {
       <svg className="theme-moon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
         <path d="M20.2 15.2A8.6 8.6 0 0 1 8.8 3.8 8.7 8.7 0 1 0 20.2 15.2Z" />
       </svg>
-      <span>Theme</span>
+      <span data-theme-label>Light mode</span>
     </button>
   );
 }

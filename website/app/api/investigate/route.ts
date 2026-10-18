@@ -5,8 +5,6 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const MAX_QUESTION_LENGTH = 500;
-const MUTATION_INTENT =
-  /^\s*(?:please\s+)?(?:create|add|assign|unassign|block|unblock|complete|finish|mark|set|update|rename|delete|remove|archive|restore|join|leave|link)\b/i;
 
 type BackendResponse = {
   answer?: unknown;
@@ -29,8 +27,14 @@ function isSafeSource(source: unknown): source is { title: string; url: string; 
 export async function POST(request: NextRequest) {
   const origin = request.headers.get("origin");
   const host = request.headers.get("host");
-  if (origin && host && new URL(origin).host !== host) {
-    return NextResponse.json({ error: "Request origin is not allowed." }, { status: 403 });
+  if (origin && host) {
+    try {
+      if (new URL(origin).host !== host) {
+        return NextResponse.json({ error: "Request origin is not allowed." }, { status: 403 });
+      }
+    } catch {
+      return NextResponse.json({ error: "Request origin is not allowed." }, { status: 403 });
+    }
   }
 
   const configuredAccessToken = process.env.SIGMAAGENT_WEB_ACCESS_TOKEN;
@@ -66,13 +70,6 @@ export async function POST(request: NextRequest) {
       { status: 400 },
     );
   }
-  if (MUTATION_INTENT.test(question)) {
-    return NextResponse.json(
-      { error: "The web workspace is read-only. Use the connected Discord workflow for approved task updates." },
-      { status: 400 },
-    );
-  }
-
   const configuredUrl = process.env.SIGMAAGENT_API_URL || process.env.INVESTIGATION_API_URL;
   const apiUrl = configuredUrl || "http://127.0.0.1:8000/investigate";
   let target: URL;
@@ -91,7 +88,7 @@ export async function POST(request: NextRequest) {
     const upstream = await fetch(target, {
       method: "POST",
       headers,
-      body: JSON.stringify({ question: question.trim() }),
+      body: JSON.stringify({ question: question.trim(), read_only: true }),
       cache: "no-store",
       signal: AbortSignal.timeout(45_000),
     });

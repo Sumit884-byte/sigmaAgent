@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 import ThemeToggle from "@/app/components/ThemeToggle";
 
 type Source = { title: string; url: string; type: string };
@@ -15,6 +15,14 @@ const suggestions = [
 ];
 
 function AnswerText({ text }: { text: string }) {
+  function renderSegments(content: string): ReactNode {
+    return content.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g).map((part, partIndex) => {
+      if (part.startsWith("**") && part.endsWith("**")) return <strong key={partIndex}>{part.slice(2, -2)}</strong>;
+      if (part.startsWith("*") && part.endsWith("*")) return <em key={partIndex}>{part.slice(1, -1)}</em>;
+      return <span key={partIndex}>{part}</span>;
+    });
+  }
+
   return (
     <div className="workspace-answer-text">
       {text.split(/\n+/).map((line, index) => {
@@ -22,22 +30,13 @@ function AnswerText({ text }: { text: string }) {
         if (!trimmed) return null;
         const item = trimmed.match(/^[-*]\s+(.+)/);
         const content = item ? item[1] : trimmed;
-        const segments = content.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g);
         return item ? (
           <div className="workspace-answer-list-item" key={`${index}-${trimmed}`}>
             <span aria-hidden="true">•</span>
-            <p>{segments.map((part, partIndex) => {
-              if (part.startsWith("**") && part.endsWith("**")) return <strong key={partIndex}>{part.slice(2, -2)}</strong>;
-              if (part.startsWith("*") && part.endsWith("*")) return <em key={partIndex}>{part.slice(1, -1)}</em>;
-              return <span key={partIndex}>{part}</span>;
-            })}</p>
+            <p>{renderSegments(content)}</p>
           </div>
         ) : (
-          <p key={`${index}-${trimmed}`}>{segments.map((part, partIndex) => {
-            if (part.startsWith("**") && part.endsWith("**")) return <strong key={partIndex}>{part.slice(2, -2)}</strong>;
-            if (part.startsWith("*") && part.endsWith("*")) return <em key={partIndex}>{part.slice(1, -1)}</em>;
-            return <span key={partIndex}>{part}</span>;
-          })}</p>
+          <p key={`${index}-${trimmed}`}>{renderSegments(content)}</p>
         );
       })}
     </div>
@@ -68,9 +67,19 @@ export default function WorkspacePage() {
         },
         body: JSON.stringify({ question: value }),
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "SigmaAgent could not answer right now.");
-      setInvestigation({ answer: payload.answer, sources: payload.sources ?? [] });
+      const payload: unknown = await response.json().catch(() => null);
+      const data = payload && typeof payload === "object" ? payload as { answer?: unknown; error?: unknown; sources?: unknown } : null;
+      if (!response.ok) {
+        const message = typeof data?.error === "string" ? data.error : "SigmaAgent could not answer right now.";
+        throw new Error(message);
+      }
+      if (!data || typeof data.answer !== "string") {
+        throw new Error("SigmaAgent returned an unreadable response. Please try again.");
+      }
+      setInvestigation({
+        answer: data.answer,
+        sources: Array.isArray(data.sources) ? data.sources as Source[] : [],
+      });
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "SigmaAgent could not answer right now.");
     } finally {
@@ -86,8 +95,11 @@ export default function WorkspacePage() {
           <span className="brand-name">SigmaAgent<span>Company Brain</span></span>
         </Link>
         <nav aria-label="Workspace navigation">
-          <Link href="/index.html#capabilities">How it helps</Link>
-          <Link href="/index.html#workspace">Sample answers</Link>
+          {/* These native anchors target sections in the public HTML landing page. */}
+          {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
+          <a href="/#capabilities">How it helps</a>
+          {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
+          <a href="/#workspace">Sample answers</a>
           <Link href="/discord">Use in Discord</Link>
         </nav>
         <span className="workspace-mode"><i /> INVESTIGATION WORKSPACE</span>
@@ -104,7 +116,7 @@ export default function WorkspacePage() {
           className="workspace-access-input"
           id="workspace-access"
           type="password"
-          autoComplete="current-password"
+          autoComplete="off"
           value={accessToken}
           onChange={(event) => setAccessToken(event.target.value)}
           placeholder="Enter your team access key if required"

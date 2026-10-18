@@ -14,9 +14,7 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body suppressHydrationWarning>
-        <Script id="sigma-theme-init" strategy="beforeInteractive">
-          {`try { document.documentElement.dataset.theme = localStorage.getItem("sigma-theme") === "light" ? "light" : "dark"; } catch { document.documentElement.dataset.theme = "dark"; }`}
-        </Script>
+        <Script src="/theme.js" strategy="beforeInteractive" />
         {children}
       </body>
     </html>
