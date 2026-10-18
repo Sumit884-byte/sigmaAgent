@@ -450,6 +450,67 @@ class InvestigateRequest(BaseModel):
     discord: dict | None = None
 
 
+class SourceItem(BaseModel):
+    title: str
+    url: str
+    type: str  # discord | github | doc | external
+
+
+class InvestigateResponse(BaseModel):
+    answer: str
+    sources: list[SourceItem] = []
+    cypher_used: str | None = None
+
+
+def _infer_source_type(url: str) -> str:
+    lower = url.lower()
+    if "discord.com" in lower:
+        return "discord"
+    if "github.com" in lower:
+        return "github"
+    if url.startswith("#") or "doc" in lower or ".md" in lower:
+        return "doc"
+    return "external"
+
+
+def _extract_sources_and_cypher(answer_text: str) -> tuple[list[dict[str, str]], str | None]:
+    """Parse out structured sources and Cypher query from an answer string."""
+    sources: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    for title, url in re.findall(r"\[([^\]]+)\]\((https?://[^\s)]+|#[^\s)]+)\)", answer_text):
+        if url not in seen_urls:
+            seen_urls.add(url)
+            sources.append({
+                "title": title.strip(),
+                "url": url.strip(),
+                "type": _infer_source_type(url),
+            })
+
+    for url in re.findall(r"(?<!\()(https?://[^\s)<>\"']+)", answer_text):
+        clean_url = url.rstrip(".,;!?")
+        if clean_url not in seen_urls:
+            seen_urls.add(clean_url)
+            sources.append({
+                "title": clean_url,
+                "url": clean_url,
+                "type": _infer_source_type(clean_url),
+            })
+
+    cypher_matches = re.findall(r"```cypher\s*\n(.*?)\n```", answer_text, flags=re.DOTALL)
+    cypher_used = "\n\n".join(m.strip() for m in cypher_matches) if cypher_matches else None
+    return sources, cypher_used
+
+
+def _format_investigate_response(answer: str) -> dict[str, Any]:
+    sources, cypher_used = _extract_sources_and_cypher(answer)
+    return {
+        "answer": answer,
+        "sources": sources,
+        "cypher_used": cypher_used,
+    }
+
+
 class TaskChange(BaseModel):
     # create | assign | unassign | block | unblock | set_status | rename | delete
     # | join_team | leave_team | link_github
@@ -758,6 +819,16 @@ def _evidence_line(item):
     return f"[{text}]({item['url']})" if item["url"] else text
 
 
+EXPERTISE_EVIDENCE_QUERY = """
+MATCH (d:Developer)
+OPTIONAL MATCH (d)-[:ASSIGNED_TO]->(t:Task)
+OPTIONAL MATCH (d)-[:SAME_AS]->(gh:GitHubUser)-[:AUTHORED]->(c:Commit)-[:TOUCHES]->(f:File)
+OPTIONAL MATCH (gh)-[:OPENED|ASSIGNED]->(i:Issue)
+OPTIONAL MATCH (sec:DocSection)-[:MENTIONS]->(d)
+RETURN d.name, count(DISTINCT c) AS commits, count(DISTINCT i) AS issues, count(DISTINCT sec) AS docs
+""".strip()
+
+
 def _expertise_answer(question, guild_id, discord):
     """`who knows about X`: people ranked by graph evidence, each with linked proof."""
     if EXPERTS_OVERVIEW_RE.match(question):
@@ -787,7 +858,8 @@ def _expertise_answer(question, guild_id, discord):
         more = len(person["evidence"]) - 3
         lines.append(f"{rank}. **{person['person']}** (score {person['score']:g}): {evidence}"
                      + (f"; +{more} more" if more > 0 else ""))
-    return "\n".join(lines) + f"\n\nEvidence paths searched: {EVIDENCE_PATHS}"
+    params = {"topic": topic}
+    return "\n".join(lines) + f"\n\nEvidence paths searched: {EVIDENCE_PATHS}\n\nGraph query used:\n{_cypher_block(EXPERTISE_EVIDENCE_QUERY, params)}"
 
 
 def _teams_answer(question, guild_id):
@@ -977,27 +1049,30 @@ def _explain_dependency_path(question, guild_id, tasks):
     return f"{answer}\n\nGraph query used:\n{query_display}"
 
 
+TASK_CHANGE_PROVENANCE_QUERY = """
+MATCH (event:TaskChange {guild_id: $guild_id})
+WHERE ($task_id IS NULL OR event.task_id = $task_id)
+  AND ($action IS NULL OR event.action = $action)
+  AND ($developer_name IS NULL OR event.developer_name = $developer_name)
+OPTIONAL MATCH (event)-[:AFFECTS]->(task:Task {guild_id: $guild_id})
+WHERE $task_id IS NULL OR task.id = $task_id
+OPTIONAL MATCH (event)-[:MADE_BY]->(actor:DiscordAuthor)
+OPTIONAL MATCH (event)-[:TRIGGERED_BY]->(message:DiscordMessage)
+RETURN event.action, event.task_id, event.task_title, event.summary,
+       coalesce(event.actor_name, actor.discord_name), event.actor_id,
+       coalesce(event.timestamp, message.timestamp),
+       coalesce(event.source_url, message.source_url),
+       event.developer_name, event.details
+ORDER BY event.timestamp DESC
+LIMIT 50
+""".strip()
+
+
 def _task_change_history(guild_id, task_id=None, *, action=None, developer_name=None):
     """Return source-linked task changes, newest first, for this Discord server."""
     graph = tenant_graph(guild_id)
     result = graph.query(
-        """
-        MATCH (event:TaskChange {guild_id: $guild_id})
-        WHERE ($task_id IS NULL OR event.task_id = $task_id)
-          AND ($action IS NULL OR event.action = $action)
-          AND ($developer_name IS NULL OR event.developer_name = $developer_name)
-        OPTIONAL MATCH (event)-[:AFFECTS]->(task:Task {guild_id: $guild_id})
-        WHERE $task_id IS NULL OR task.id = $task_id
-        OPTIONAL MATCH (event)-[:MADE_BY]->(actor:DiscordAuthor)
-        OPTIONAL MATCH (event)-[:TRIGGERED_BY]->(message:DiscordMessage)
-        RETURN event.action, event.task_id, event.task_title, event.summary,
-               coalesce(event.actor_name, actor.discord_name), event.actor_id,
-               coalesce(event.timestamp, message.timestamp),
-               coalesce(event.source_url, message.source_url),
-               event.developer_name, event.details
-        ORDER BY event.timestamp DESC
-        LIMIT 50
-        """,
+        TASK_CHANGE_PROVENANCE_QUERY,
         {"guild_id": guild_id, "task_id": task_id, "action": action,
          "developer_name": developer_name},
     )
@@ -1031,6 +1106,7 @@ def _ownership_provenance_answer(question, guild_id, tasks):
     if not owners:
         return None
     lines = [f"Current owner(s) of **{task_id}: {title}**: **{', '.join(owners)}**."]
+    params = {"guild_id": str(guild_id), "task_id": task_id, "action": "assign"}
     for owner in owners:
         history = _task_change_history(guild_id, task_id, action="assign", developer_name=owner)
         source = next((item for item in history if item["source_url"] and item["actor_name"]), None)
@@ -1044,7 +1120,8 @@ def _ownership_provenance_answer(question, guild_id, tasks):
             date = "an unknown date"
         lines.append(f"**{owner}** was assigned by **{source['actor_name']}** on {date} "
                      f"([source message]({source['source_url']})).")
-    return "\n".join(lines)
+    answer = "\n".join(lines)
+    return f"{answer}\n\nGraph query used:\n{_cypher_block(TASK_CHANGE_PROVENANCE_QUERY, params)}"
 
 
 def _relevant_task_change_context(question, guild_id, tasks):
@@ -1614,6 +1691,9 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
         "AND a join_team (developer 'Sam', team 'payments'). Before answering, re-read the message and check that each "
         "stated fact about tasks, owners, dependencies, teams or GitHub accounts has its own change.\n"
         "Docs, commits and issues: when they answer the question, cite them with their link as [title](link). "
+        "When citing Discord messages, link directly to the message as [date](link) or [author](link). "
+        "Always provide clickable markdown links for every fact derived from docs, commits, issues, or Discord messages. "
+        "If multiple sources contribute to an answer, conclude with a bulleted 'Sources:' section linking each reference.\n"
         "For 'who knows about X' questions, suggest asking exactly 'who knows about X' for a ranked, evidence-backed answer.\n"
         "Dependencies: 'depends on' means the task can't finish until those are done. When explaining dependencies, "
         "show the ordered dependency path (for example T5 ← T4 ← T3) and the owner of each step, "
@@ -1781,41 +1861,41 @@ def investigate(req: InvestigateRequest):
 
     discord = req.discord or {}
     if HELP_RE.match(req.question):
-        return {"answer": HELP_TEXT}
+        return _format_investigate_response(HELP_TEXT)
     # Requests from outside Discord (e.g. curl) use the default server
     server_id = discord.get("guild_id") if req.discord else os.getenv("DISCORD_GUILD_ID")
     if server_id:
         for command in (_sync_answer, _teams_answer, _gc_answer):
             command_answer = command(req.question, server_id)
             if command_answer is not None:
-                return {"answer": command_answer}
+                return _format_investigate_response(command_answer)
         expertise_answer = _expertise_answer(req.question, server_id, discord)
         if expertise_answer is not None:
-            return {"answer": expertise_answer}
+            return _format_investigate_response(expertise_answer)
     # Repository questions don't depend on a server's task graph, so answer them next
     is_people_statement = PEOPLE_STATEMENT_RE.search(req.question) and not req.question.rstrip().endswith("?")
     github_answer = None if is_people_statement else answer_github_question(req.question)
     if github_answer is not None:
-        return {"answer": github_answer}
+        return _format_investigate_response(github_answer)
     # Requests from outside Discord (e.g. curl) use the default server
     guild_id = discord.get("guild_id") if req.discord else os.getenv("DISCORD_GUILD_ID")
     if not guild_id:
-        return {"answer": "Ask me in a server channel; I only know about tasks that belong to a server."}
+        return _format_investigate_response("Ask me in a server channel; I only know about tasks that belong to a server.")
 
     tasks = _all_tasks(guild_id)
     explain_answer = _explain_dependency_path(req.question, guild_id, tasks)
     if explain_answer is not None:
-        return {"answer": explain_answer}
+        return _format_investigate_response(explain_answer)
     for command in (_impact_answer, _bottleneck_answer):
         command_answer = command(req.question, guild_id)
         if command_answer is not None:
-            return {"answer": command_answer}
+            return _format_investigate_response(command_answer)
     ownership_answer = _ownership_provenance_answer(req.question, guild_id, tasks)
     if ownership_answer is not None:
-        return {"answer": ownership_answer}
+        return _format_investigate_response(ownership_answer)
     task_command_answer = _direct_task_command_answer(req.question, guild_id, discord)
     if task_command_answer is not None:
-        return {"answer": task_command_answer}
+        return _format_investigate_response(task_command_answer)
     gemini = _gemini_client()
     if gemini:
         try:
@@ -1823,9 +1903,9 @@ def investigate(req: InvestigateRequest):
             messages = _channel_history(req.question, discord)
             reply = _ask_gemini(gemini, req.question, guild_id, messages, author, tasks)
         except GeminiUnavailable:
-            return {"answer": "Gemini is out of free quota or overloaded on every model I can use, "
-                              "so I can't answer properly right now; nothing was changed. "
-                              "Try again later, or add billing to the Gemini key for higher limits."}
+            return _format_investigate_response("Gemini is out of free quota or overloaded on every model I can use, "
+                                              "so I can't answer properly right now; nothing was changed. "
+                                              "Try again later, or add billing to the Gemini key for higher limits.")
         except Exception as exc:
             print(f"Gemini request failed, using rule-based answer: {exc}")
         else:
@@ -1855,12 +1935,12 @@ def investigate(req: InvestigateRequest):
                     answer = _answer_after_changes(gemini, req.question, guild_id, applied) or answer
                 except Exception as exc:
                     print(f"Follow-up answer failed, keeping the first one: {exc}")
-            return {"answer": "\n".join([answer] + applied + lines)}
+            return _format_investigate_response("\n".join([answer] + applied + lines))
 
     if not tasks:
-        return {"answer": "This server has no tasks yet. Add them to `tasks.json` with this server's guild_id and run `ingest_tasks.py`."}
+        return _format_investigate_response("This server has no tasks yet. Add them to `tasks.json` with this server's guild_id and run `ingest_tasks.py`.")
 
-    return {"answer": _rule_based_answer(req.question, tasks)}
+    return _format_investigate_response(_rule_based_answer(req.question, tasks))
 
 
 def _rule_based_answer(question, tasks):

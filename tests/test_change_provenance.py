@@ -518,5 +518,189 @@ class FalkorDbDependencyPathIntegrationTests(unittest.TestCase):
             graph.query("MATCH (n) DETACH DELETE n")
 
 
+class AnswerWithSourcesTests(unittest.TestCase):
+    """Verify that every /investigate response carries structured sources and cypher_used."""
+
+    # ------------------------------------------------------------------
+    # Unit tests for the pure helpers (no HTTP)
+    # ------------------------------------------------------------------
+
+    def test_extract_sources_finds_markdown_links(self):
+        text = (
+            "See [PR #42](https://github.com/org/repo/pull/42) and "
+            "[auth spec](https://github.com/org/repo/blob/main/auth.md)."
+        )
+        sources, cypher = api._extract_sources_and_cypher(text)
+        self.assertIsNone(cypher)
+        urls = [s["url"] for s in sources]
+        self.assertIn("https://github.com/org/repo/pull/42", urls)
+        self.assertIn("https://github.com/org/repo/blob/main/auth.md", urls)
+        types = {s["url"]: s["type"] for s in sources}
+        self.assertEqual(types["https://github.com/org/repo/pull/42"], "github")
+
+    def test_extract_sources_deduplicates_urls(self):
+        url = "https://discord.com/channels/1/2/3"
+        text = f"[first]({url}) and [second]({url})"
+        sources, _ = api._extract_sources_and_cypher(text)
+        self.assertEqual(len(sources), 1)
+
+    def test_extract_sources_finds_plain_url(self):
+        # Use a URL that has no 'doc' / '.md' / 'github' / 'discord' token so it maps to 'external'
+        text = "More info at https://example.com/help/page"
+        sources, _ = api._extract_sources_and_cypher(text)
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["url"], "https://example.com/help/page")
+        self.assertEqual(sources[0]["type"], "external")
+
+    def test_extract_cypher_block(self):
+        text = (
+            "Answer here.\n\nGraph query used:\n"
+            "```cypher\nMATCH (t:Task) RETURN t\n```"
+        )
+        _, cypher = api._extract_sources_and_cypher(text)
+        self.assertIsNotNone(cypher)
+        self.assertIn("MATCH (t:Task)", cypher)
+
+    def test_infer_source_type_discord(self):
+        self.assertEqual(api._infer_source_type("https://discord.com/channels/1/2/3"), "discord")
+
+    def test_infer_source_type_github(self):
+        self.assertEqual(api._infer_source_type("https://github.com/org/repo"), "github")
+
+    def test_infer_source_type_doc(self):
+        self.assertEqual(api._infer_source_type("https://example.com/readme.md"), "doc")
+
+    def test_infer_source_type_external(self):
+        self.assertEqual(api._infer_source_type("https://jira.example.com/ticket/1"), "external")
+
+    def test_format_investigate_response_structure(self):
+        result = api._format_investigate_response(
+            "See [the PR](https://github.com/x/y/pull/1).\n\n"
+            "Graph query used:\n```cypher\nMATCH (n) RETURN n\n```"
+        )
+        self.assertIn("answer", result)
+        self.assertIn("sources", result)
+        self.assertIn("cypher_used", result)
+        self.assertEqual(result["sources"][0]["type"], "github")
+        self.assertIn("MATCH (n)", result["cypher_used"])
+
+    # ------------------------------------------------------------------
+    # Integration tests via the HTTP client
+    # ------------------------------------------------------------------
+
+    def setUp(self):
+        self.graph = RecordingGraph()
+        # Override the default task so Person 4 is already the owner (matching events)
+        self.graph.tasks = [["T5", "Build LLM Agent", "Person 4", None, "todo"]]
+        self.original_tenant_graph = api.tenant_graph
+        api.tenant_graph = lambda _guild_id: self.graph
+        self.client = TestClient(api.app)
+        self.discord = {
+            "guild_id": "123456789012345678",
+            "channel_id": "234567890123456789",
+            "message_id": "345678901234567890",
+            "author_id": "456789012345678901",
+            "author_name": "Sumit",
+            "timestamp": "2026-10-16T12:34:56+00:00",
+            "message_content": "<@999999999999999999> assign T5 to Person 4",
+        }
+
+    def tearDown(self):
+        api.tenant_graph = self.original_tenant_graph
+
+    def test_explain_response_has_cypher_used(self):
+        """explain T5 must return cypher_used extracted from the answer."""
+        self.graph.tasks = [
+            ["T5", "Build LLM Agent", "Person 4", "Build API", "todo"],
+            ["T4", "Build API", "Person 2", "Plan API", "in_progress"],
+            ["T3", "Plan API", "Person 3", None, "done"],
+        ]
+        self.graph.dependencies = [["T5", "T4"], ["T4", "T3"]]
+        with patch.object(api, "_gemini_client", return_value=None):
+            response = self.client.post("/investigate", json={
+                "question": "explain T5",
+                "discord": {"guild_id": self.discord["guild_id"]},
+            })
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("answer", data)
+        self.assertIn("sources", data)
+        self.assertIn("cypher_used", data)
+        # The explain answer embeds a ```cypher block; it must be extracted
+        self.assertIsNotNone(data["cypher_used"])
+        self.assertIn("MATCH", data["cypher_used"])
+
+    def test_ownership_provenance_response_has_cypher_and_discord_source(self):
+        """Why is T5 owned by Person 4? must return a discord source item and cypher_used."""
+        self.graph.events.append({
+            "id": "510000000000000001",
+            "guild_id": self.discord["guild_id"],
+            "action": "assign",
+            "task_id": "T5",
+            "task_title": "Build LLM Agent",
+            "summary": "Assigned",
+            "actor_name": "Sumit",
+            "actor_id": self.discord["author_id"],
+            "timestamp": "2026-10-16T12:34:56+00:00",
+            "source_url": (
+                "https://discord.com/channels/"
+                f"{self.discord['guild_id']}/"
+                f"{self.discord['channel_id']}/"
+                "510000000000000001"
+            ),
+            "developer_name": "Person 4",
+            "details": "{}",
+        })
+        with patch.object(api, "_gemini_client", return_value=None):
+            response = self.client.post("/investigate", json={
+                "question": "Why is T5 owned by Person 4?",
+                "discord": {"guild_id": self.discord["guild_id"]},
+            })
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("sources", data)
+        self.assertIn("cypher_used", data)
+        # Must extract the discord source link that provenance answer embeds
+        discord_sources = [s for s in data["sources"] if s["type"] == "discord"]
+        self.assertTrue(
+            len(discord_sources) >= 1,
+            f"Expected at least one discord source; got {data['sources']}",
+        )
+        # Cypher must be present (provenance answer appends Graph query used block)
+        self.assertIsNotNone(data["cypher_used"])
+        self.assertIn("TaskChange", data["cypher_used"])
+
+    def test_help_response_always_has_sources_and_cypher_keys(self):
+        """Help text has no URLs so sources==[] and cypher_used is None, but keys exist."""
+        response = self.client.post("/investigate", json={"question": "help"})
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("answer", data)
+        self.assertIn("sources", data)
+        self.assertIn("cypher_used", data)
+        self.assertIsInstance(data["sources"], list)
+
+    def test_no_guild_response_has_all_three_keys(self):
+        """Even the 'ask me in a server' error path returns the full structured payload."""
+        with patch.object(api, "answer_github_question", return_value=None):
+            response = self.client.post("/investigate", json={"question": "What is T5?"})
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("answer", data)
+        self.assertIn("sources", data)
+        self.assertIn("cypher_used", data)
+
+    def test_existing_tests_still_see_answer_key(self):
+        """Backwards-compat: response.json()['answer'] must still be a non-empty string."""
+        with patch.object(api, "_gemini_client", return_value=None):
+            response = self.client.post("/investigate", json={
+                "question": "explain T5",
+                "discord": {"guild_id": self.discord["guild_id"]},
+            })
+        self.assertIsInstance(response.json()["answer"], str)
+        self.assertTrue(len(response.json()["answer"]) > 0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
