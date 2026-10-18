@@ -473,7 +473,8 @@ Contributions are welcome! Here's how to get started:
 
 ---
 <br />
-## 🤖 AI Disclosure
+
+🤖 AI Disclosure
 
 This project was built with the assistance of AI coding tools.
 
@@ -487,6 +488,9 @@ This project was built with the assistance of AI coding tools.
 **What the team is responsible for:**
 Every line of code, architectural choice, graph schema design, and the overall system concept was understood, reviewed, and owned by the team. AI tools were used to accelerate development, not to replace engineering judgment. All team members can explain what was built and why.
 
+<br />
+
+---
 <br />
 
 ## 📄 License
