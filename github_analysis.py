@@ -29,6 +29,7 @@ COMMON_NON_REPOS = {
     "frontend/backend", "backend/frontend", "client/server", "server/client",
     "ci/cd", "cd/ci", "input/output", "read/write", "and/or", "true/false",
     "before/after", "left/right", "top/bottom", "up/down", "yes/no",
+    "platform/web", "web/platform",
 }
 
 
@@ -155,14 +156,30 @@ def extract_repo(question: str) -> str | None:
         if is_safe_repo(candidate):
             return candidate
 
-    # Look for explicit repo: owner/repo, repository owner/repo, in/for/to owner/repo
+    # Look for explicit repo: repo: owner/repo, repository: owner/repo
     explicit_match = re.search(
-        r"(?:repo|repository|in|for|to)\s*[:=]?\s*([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_][A-Za-z0-9_.-]{0,99})\b",
+        r"(?:repo|repository)\s*[:=]?\s*([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_][A-Za-z0-9_.-]{0,99})\b",
         question or "",
         re.IGNORECASE,
     )
     if explicit_match:
         candidate = f"{explicit_match.group(1)}/{explicit_match.group(2).rstrip('.,;:!?)]}')}"
+        if is_safe_repo(candidate):
+            return candidate
+
+    # Match in/for/to owner/repo only when the question has clear GitHub query intent
+    # (e.g. issues, bugs, PRs, commits, contributors, compare) so that plain task messages like
+    # "assign to Alice for platform/web" or "explain platform/web" are never misread as repos
+    in_match = re.search(
+        r"(?:in|for|to)\s+([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_][A-Za-z0-9_.-]{0,99})\b",
+        question or "",
+        re.IGNORECASE,
+    )
+    if in_match and (
+        GITHUB_QUERY_INTENT.search(question or "")
+        or bool(re.search(r"\b(?:compare|showdown|competition|vs\.?|versus|contributors?|commits?|issues?|bugs?|prs?)\b", question or "", re.IGNORECASE))
+    ):
+        candidate = f"{in_match.group(1)}/{in_match.group(2).rstrip('.,;:!?)]}')}"
         if is_safe_repo(candidate):
             return candidate
 
@@ -470,8 +487,8 @@ def extract_compare_users(text: str) -> list[str]:
         u_clean = u.lstrip("@").strip()
         if not u_clean or u_clean.casefold() in COMPARE_STOP_WORDS:
             return False
-        # Task IDs like T1, T2, T3 are NOT usernames
-        if re.fullmatch(r"T\d+", u_clean, re.IGNORECASE):
+        # Task IDs like T1, T2 and Jira-style ENG-123, AB2-12 (all-uppercase prefix) are NOT usernames
+        if re.fullmatch(r"(?:[A-Z][A-Z0-9]*-\d+|[Tt]\d+)", u_clean):
             return False
         return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,38}", u_clean))
 
@@ -616,8 +633,8 @@ TASK_COMMAND_PATTERN = re.compile(
     r"^\s*(?:create\s+task|add\s+task|new\s+task|assign\b|unassign\b|rename\s+task|delete\s+task|set\s+status|explain\b|mark\s+task)\b|"
     r"\bas\s+a\s+(?:new\s+)?task\b|"
     r"\bfor\s+a\s+(?:new\s+)?task\b|"
-    r"\bT\d+\s+(?:is\s+blocked\s+by|is\s+unblocked|depends\s+on|now\s+depends|no\s+longer\s+depends|is\s+done|is\s+in\s+progress|is\s+assigned)\b|"
-    r"\b(?:blocked\s+by|depends\s+on|waiting\s+on)\s+T\d+\b|"
+    r"\b(?:[A-Za-z][A-Za-z0-9]*-\d+|T\d+)\s+(?:is\s+blocked\s+by|is\s+unblocked|depends\s+on|now\s+depends|no\s+longer\s+depends|is\s+done|is\s+in\s+progress|is\s+assigned)\b|"
+    r"\b(?:blocked\s+by|depends\s+on|waiting\s+on)\s+(?:[A-Za-z][A-Za-z0-9]*-\d+|T\d+)\b|"
     r"\bwho\s+should\s+own\b",
     re.IGNORECASE,
 )

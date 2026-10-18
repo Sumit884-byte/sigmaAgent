@@ -1,18 +1,35 @@
+import asyncio
+import hashlib
+import hmac
+import json
+import logging
 import os
 import re
-import hashlib
-import json
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from falkordb import FalkorDB
 from google import genai
 from google.genai import errors as genai_errors
 from pydantic import BaseModel
 
+log = logging.getLogger("api")
+
+import continuous_sync
+from continuous_sync import (
+    BackgroundKnowledgeSyncer,
+    handle_discord_message_delete,
+    handle_discord_message_edit,
+    handle_discord_stream_message,
+    handle_github_webhook,
+    prune_graph_garbage,
+    verify_github_signature,
+)
 import knowledge
 from github_analysis import (
     GitHubNotFound,
@@ -33,16 +50,33 @@ def _gemini_client():
     key = os.getenv("GEMINI_API_KEY")
     return genai.Client(api_key=key) if key else None
 
-app = FastAPI(title="Sigma Agent API")
 
-# 1. Database Credentials
-CLOUD_HOST = os.getenv("FALKORDB_HOST", "r-6jissuruar.instance-gijzjhvh6.hc-7up0crkyn.ap-south-1.aws.f2e0a955bb84.cloud")
-CLOUD_PORT = int(os.getenv("FALKORDB_PORT", 52078))
-CLOUD_USERNAME = os.getenv("FALKORDB_USERNAME", "falkordb")
-CLOUD_PASSWORD = os.getenv("FALKORDB_PASSWORD", "password")
+# 1. Database Credentials and lazy connection
+_db: FalkorDB | None = None
 
-# 2. Connect to database
-db = FalkorDB(host=CLOUD_HOST, port=CLOUD_PORT, username=CLOUD_USERNAME, password=CLOUD_PASSWORD)
+
+def get_db() -> FalkorDB:
+    global _db
+    if _db is None:
+        host = os.getenv("FALKORDB_HOST", "localhost")
+        port = int(os.getenv("FALKORDB_PORT", 6379))
+        username = os.getenv("FALKORDB_USERNAME")
+        password = os.getenv("FALKORDB_PASSWORD")
+        _db = FalkorDB(host=host, port=port, username=username, password=password)
+    return _db
+
+
+class _LazyDBProxy:
+    """Lazy proxy so importing api.py does not initiate an immediate network connection."""
+
+    def select_graph(self, name: str):
+        return get_db().select_graph(name)
+
+    def __getattr__(self, name: str):
+        return getattr(get_db(), name)
+
+
+db = _LazyDBProxy()
 
 # Each Discord server gets its own FalkorDB graph, so its tasks, people and chat history never mix
 # with another server's, and graph algorithms (PageRank, WCC) only ever see one team's work
@@ -67,6 +101,33 @@ def tenant_graph(guild_id):
         knowledge.ensure_indexes(graph)
         _tenant_graphs[name] = graph
     return _tenant_graphs[name]
+
+
+GITHUB_REPO = os.getenv("GITHUB_REPO", "Sumit884-byte/sigmaAgent")
+
+
+def _default_graph_provider():
+    guild_id = os.getenv("DISCORD_GUILD_ID", "1")
+    try:
+        return tenant_graph(guild_id)
+    except Exception:
+        return None
+
+
+background_syncer = BackgroundKnowledgeSyncer(
+    graph_provider=_default_graph_provider,
+    default_repo=GITHUB_REPO,
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    background_syncer.start()
+    yield
+    background_syncer.stop()
+
+
+app = FastAPI(title="Sigma Agent API", lifespan=lifespan)
 
 
 # 3. Create the API Endpoint
@@ -100,8 +161,8 @@ GITHUB_REPO = os.getenv("GITHUB_REPO", "Sumit884-byte/sigmaAgent")
 
 def _github_http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, GitHubNotFound):
-        return HTTPException(status_code=404, detail=str(exc))
-    return HTTPException(status_code=503, detail=str(exc))
+        return HTTPException(status_code=404, detail="GitHub repository or issue not found")
+    return HTTPException(status_code=503, detail="GitHub service is currently unavailable")
 
 
 @app.get("/github/contributors")
@@ -161,15 +222,226 @@ class KnowledgeSyncRequest(BaseModel):
 
 
 @app.post("/knowledge/sync")
-def knowledge_sync(req: KnowledgeSyncRequest):
+def knowledge_sync(req: KnowledgeSyncRequest, request: Request):
     """Pull a GitHub repo's commits, issues/PRs and Markdown docs into one server's graph."""
+    _verify_internal_api_key(request)
     try:
         graph = tenant_graph(req.guild_id)
         return knowledge.sync_repository(graph, req.repo or GITHUB_REPO, max_commits=req.max_commits)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid request parameters") from None
     except (GitHubNotFound, GitHubUnavailable) as exc:
         raise _github_http_error(exc) from exc
+
+
+def _verify_internal_api_key(request: Request) -> None:
+    expected_key = os.getenv("INVESTIGATION_API_KEY", "").strip()
+    if not expected_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Investigation API key is not configured on the server",
+        )
+    auth_header = request.headers.get("Authorization") or ""
+    api_key_header = request.headers.get("X-API-Key") or ""
+    token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else auth_header.strip()
+    expected_bytes = expected_key.encode("utf-8")
+    token_valid = hmac.compare_digest(token.encode("utf-8"), expected_bytes) if token else False
+    header_valid = hmac.compare_digest(api_key_header.strip().encode("utf-8"), expected_bytes) if api_key_header else False
+    if not (token_valid or header_valid):
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing API key")
+
+
+def _resolve_guild_for_repo(repo: str, request: Request | None = None) -> str:
+    """Map a repository to its Discord guild on the backend rather than trusting unverified caller headers."""
+    repo_map_raw = os.getenv("REPO_TO_GUILD_MAP", "{}").strip() or "{}"
+    try:
+        repo_map = json.loads(repo_map_raw)
+        if isinstance(repo_map, dict) and repo in repo_map:
+            return str(repo_map[repo])
+    except Exception:
+        pass
+
+    default_guild = os.getenv("DISCORD_GUILD_ID")
+    if default_guild:
+        return str(default_guild)
+
+    if os.getenv("ALLOW_INSECURE_WEBHOOKS", "").lower() in ("true", "1", "yes"):
+        if request:
+            custom = request.headers.get("X-Discord-Guild-ID") or request.query_params.get("guild_id")
+            if custom:
+                return str(custom)
+
+    raise ValueError(f"Repository {repo!r} is not mapped to any known Discord guild")
+
+
+@app.post("/webhooks/github")
+async def github_webhook(request: Request):
+    """Receive live GitHub webhooks (push, issues, pull_request) to keep the graph automatically current."""
+    event = request.headers.get("X-GitHub-Event")
+    if not event:
+        raise HTTPException(status_code=400, detail="Missing X-GitHub-Event header")
+
+    body_bytes = await request.body()
+    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+    signature = request.headers.get("X-Hub-Signature-256")
+    if not verify_github_signature(body_bytes, signature, secret):
+        raise HTTPException(status_code=401, detail="Invalid X-Hub-Signature-256 signature")
+
+    try:
+        payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Malformed JSON payload") from exc
+
+    repo_data = payload.get("repository") or {}
+    repo = repo_data.get("full_name") or ""
+    try:
+        guild_id = _resolve_guild_for_repo(repo, request)
+    except ValueError as exc:
+        log.warning("Unmapped repo in webhook: %s", exc)
+        raise HTTPException(status_code=400, detail="Repository is not mapped to any known Discord guild") from exc
+
+    try:
+        graph = tenant_graph(guild_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid target graph or server configuration") from exc
+
+    try:
+        result = await asyncio.to_thread(handle_github_webhook, graph, event, payload)
+        background_syncer.webhook_events_count += 1
+        return result
+    except GitHubNotFound as exc:
+        raise HTTPException(status_code=404, detail="Repository not found") from exc
+    except GitHubUnavailable as exc:
+        raise HTTPException(status_code=503, detail="GitHub API unavailable") from exc
+
+
+@app.get("/knowledge/sync/status")
+def knowledge_sync_status(request: Request):
+    """Inspect background knowledge syncer health, stats, and webhook event counts."""
+    _verify_internal_api_key(request)
+    return background_syncer.get_status()
+
+
+@app.post("/knowledge/sync/run-now")
+async def knowledge_sync_run_now(request: Request):
+    """Trigger an immediate background synchronization cycle across configured repositories."""
+    _verify_internal_api_key(request)
+    return await background_syncer.sync_now()
+
+
+class DiscordStreamMessageRequest(BaseModel):
+    guild_id: str | None = None
+    guild_name: str | None = None
+    channel_id: str
+    channel_name: str | None = None
+    message_id: str
+    author_id: str
+    author_name: str
+    content: str
+    timestamp: str | None = None
+    source_url: str | None = None
+
+
+class DiscordMessageEditRequest(BaseModel):
+    content: str
+    edited_at: str | None = None
+    guild_id: str | None = None
+
+
+class GraphGCRequest(BaseModel):
+    guild_id: str | None = None
+    max_message_age_days: int | None = None
+    prune_orphan_docsections: bool = True
+    prune_orphan_files: bool = True
+    prune_orphan_topics: bool = True
+    prune_deleted_messages: bool = True
+
+
+@app.post("/discord/stream-message")
+def discord_stream_message(req: DiscordStreamMessageRequest, request: Request):
+    """Ingest a live Discord message into the server's graph in real time."""
+    _verify_internal_api_key(request)
+    guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "")
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="guild_id is required when DISCORD_GUILD_ID is not set")
+    try:
+        graph = tenant_graph(guild_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid target graph or server configuration") from exc
+
+    payload = req.model_dump()
+    result = handle_discord_stream_message(graph, payload)
+    background_syncer.streamed_messages_count += 1
+    return result
+
+
+@app.put("/discord/stream-message/{message_id}")
+def discord_stream_message_edit(message_id: str, req: DiscordMessageEditRequest, request: Request):
+    """Update a live Discord message's content in the server's graph in real time."""
+    _verify_internal_api_key(request)
+    guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "")
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="guild_id is required when DISCORD_GUILD_ID is not set")
+    try:
+        graph = tenant_graph(guild_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid target graph or server configuration") from exc
+
+    return handle_discord_message_edit(graph, message_id, req.content, req.edited_at)
+
+
+@app.delete("/discord/stream-message/{message_id}")
+def discord_stream_message_delete(message_id: str, request: Request, guild_id: str | None = None, soft_delete: bool = True):
+    """Delete or soft-delete a Discord message in the server's graph."""
+    _verify_internal_api_key(request)
+    gid = guild_id or os.getenv("DISCORD_GUILD_ID", "")
+    if not gid:
+        raise HTTPException(status_code=400, detail="guild_id is required when DISCORD_GUILD_ID is not set")
+    try:
+        graph = tenant_graph(gid)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid target graph or server configuration") from exc
+
+    return handle_discord_message_delete(graph, message_id, soft_delete=soft_delete)
+
+
+@app.post("/knowledge/gc")
+def knowledge_gc(request: Request, req: GraphGCRequest | None = None):
+    """Run graph garbage collection to prune disconnected sections, files, topics, and stale messages."""
+    _verify_internal_api_key(request)
+    req = req or GraphGCRequest()
+    guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "")
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="guild_id is required when DISCORD_GUILD_ID is not set")
+    try:
+        graph = tenant_graph(guild_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid target graph or server configuration") from exc
+
+    stats = prune_graph_garbage(
+        graph,
+        max_message_age_days=req.max_message_age_days,
+        prune_orphan_docsections=req.prune_orphan_docsections,
+        prune_orphan_files=req.prune_orphan_files,
+        prune_orphan_topics=req.prune_orphan_topics,
+        prune_deleted_messages=req.prune_deleted_messages,
+    )
+    background_syncer.total_gc_count += 1
+    background_syncer.last_gc_time = datetime.now(timezone.utc).isoformat()
+    background_syncer.last_gc_result = stats
+    return {"status": "success", "guild_id": guild_id, "stats": stats}
+
+
+@app.get("/knowledge/gc/status")
+def knowledge_gc_status(request: Request):
+    """Get the latest garbage collection metrics."""
+    _verify_internal_api_key(request)
+    return {
+        "total_gc_count": background_syncer.total_gc_count,
+        "last_gc_time": background_syncer.last_gc_time,
+        "last_gc_result": background_syncer.last_gc_result,
+    }
+
 
 
 class InvestigateRequest(BaseModel):
@@ -463,6 +735,10 @@ SYNC_RE = re.compile(
     r"^\s*sync\s+(?:github|repo|knowledge|docs)(?:\s+(?:repo\s+)?(?P<repo>[A-Za-z0-9][\w-]*/[\w.-]+))?\s*[.!]*\s*$",
     re.IGNORECASE,
 )
+GC_RE = re.compile(
+    r"^\s*(?:run\s+gc|garbage\s+collect(?:ion)?|prune\s+graph|clean\s+graph|clean\s+stale\s+knowledge)\s*[?!.]*\s*$",
+    re.IGNORECASE,
+)
 PEOPLE_STATEMENT_RE = re.compile(
     r"\b(?:is|are|'s)\s+[^.?!\n]{1,40}?\s+on\s+github\b|\bgithub\s+(?:user(?:name)?|handle|account|login|id)\b|"
     r"\bgithub\s+(?:is|=|:)\s*@?[A-Za-z0-9-]+|\bon\s+github\s+as\s+@?[A-Za-z0-9-]+|"
@@ -556,14 +832,24 @@ def _sync_answer(question, guild_id):
         counts = knowledge.sync_repository(graph, repo)
     except GitHubNotFound:
         return (f"I couldn't find **{repo}** on GitHub. If it's private, set `GITHUB_TOKEN` in the backend `.env`.")
-    except GitHubUnavailable as exc:
-        return f"I couldn't reach GitHub: {exc}. Nothing was changed."
+    except GitHubUnavailable:
+        return "I couldn't reach GitHub right now. Nothing was changed."
     answer = (f"Synced **{repo}** into this server's graph: {counts['commits']} commits, "
               f"{counts['issues']} issues/PRs, {counts['documents']} docs ({counts['sections']} sections), "
               f"expertise for {counts['topics']} topics. Try `who knows about <topic>` or `experts`.")
     if counts["warnings"]:
         answer += "\nNote: " + "; ".join(counts["warnings"][:3])
     return answer
+
+
+def _gc_answer(question, guild_id):
+    if not GC_RE.match(question):
+        return None
+    return (
+        "Garbage collection modifies graph state and cannot be run via regular chat commands. "
+        "To maintain read-only safety, garbage collection must be executed through the authenticated "
+        "administration endpoint `/knowledge/gc` with explicit parameters."
+    )
 
 
 DEPENDENCY_PATH_QUERY = """
@@ -618,7 +904,7 @@ def _explain_dependency_path(question, guild_id, tasks):
 
     task_rows = _aggregate_task_rows(tasks)
     task_matches = [row for row in task_rows if str(row[0]).casefold() == target_ref.casefold()]
-    is_task_id = bool(re.fullmatch(r"T\d+", target_ref, flags=re.IGNORECASE))
+    is_task_id = bool(re.fullmatch(r"(?:[A-Za-z][A-Za-z0-9]*-\d+|T\d+)", target_ref, flags=re.IGNORECASE))
     is_quoted_title = raw_ref.startswith(("\"", "'")) and raw_ref[-1:] == raw_ref[:1]
     if not task_matches:
         task_matches = [row for row in task_rows if str(row[1]).casefold() == target_ref.casefold()]
@@ -731,7 +1017,7 @@ def _ownership_provenance_answer(question, guild_id, tasks):
     lowered = question.casefold()
     if "why" not in lowered or not re.search(r"\b(owner|owned|assign|assigned)\b", lowered):
         return None
-    task_match = re.search(r"\bT\d+\b", question, flags=re.IGNORECASE)
+    task_match = re.search(r"\b(?:[A-Za-z][A-Za-z0-9]*-\d+|T\d+)\b", question, flags=re.IGNORECASE)
     grouped_tasks = _aggregate_task_rows(tasks)
     if task_match:
         matches = [row for row in grouped_tasks if row[0].casefold() == task_match.group(0).casefold()]
@@ -766,7 +1052,7 @@ def _relevant_task_change_context(question, guild_id, tasks):
     if not re.search(r"\bwhy\b", question, flags=re.IGNORECASE):
         return "(no task-change history requested)"
     grouped_tasks = _aggregate_task_rows(tasks)
-    ids = {match.casefold() for match in re.findall(r"\bT\d+\b", question, flags=re.IGNORECASE)}
+    ids = {match.casefold() for match in re.findall(r"\b(?:[A-Za-z][A-Za-z0-9]*-\d+|T\d+)\b", question, flags=re.IGNORECASE)}
     matched = [row for row in grouped_tasks if row[0].casefold() in ids]
     if not matched:
         matched = [row for row in grouped_tasks
@@ -1365,15 +1651,141 @@ def _ask_gemini(gemini, question, guild_id, messages, author, tasks):
     return response.parsed
 
 
+NON_DEV_PHRASES = {
+    "next sprint", "this sprint", "sprint", "tomorrow", "today", "yesterday",
+    "v1", "v2", "mvp", "production", "staging", "testing", "review",
+    "frontend", "backend", "database", "api", "mobile", "ios", "android",
+    "release", "deployment", "demo", "hackathon",
+}
+
+
+def _clean_developer_name(dev: str | None, graph: Any) -> str | None:
+    if not dev:
+        return None
+    cleaned = dev.strip().strip("\"'`")
+    if not cleaned or cleaned.casefold() in NON_DEV_PHRASES:
+        return None
+    known = {row[0].casefold(): row[0] for row in graph.ro_query("MATCH (d:Developer) RETURN d.name").result_set}
+    if cleaned.casefold() in known:
+        return known[cleaned.casefold()]
+    if re.search(r"\b(?:and|or|for|with|in|on|at|by|to|is|will|should|next|this|last)\b", cleaned, re.IGNORECASE):
+        return None
+    if len(cleaned.split()) > 3:
+        return None
+    return cleaned
+
+
+DIRECT_CREATE_TASK_RE = re.compile(
+    r"^\s*(?:create|add|new)\s+task\s+(?P<title>.+?)(?:\s+(?:for|assigned to)\s+(?P<dev>[A-Za-z0-9_ -]+))?\s*$",
+    re.IGNORECASE,
+)
+DIRECT_ASSIGN_RE = re.compile(
+    r"^\s*assign\s+(?P<task>(?:[A-Za-z][A-Za-z0-9]*-\d+|T\d+)|[A-Za-z0-9_ -]+?)\s+to\s+(?P<dev>[A-Za-z0-9_ -]+)\s*[!.?]*\s*$",
+    re.IGNORECASE,
+)
+DIRECT_STATUS_RE = re.compile(
+    r"^\s*(?:mark|set\s+status\s+of)\s+(?P<task>(?:[A-Za-z][A-Za-z0-9]*-\d+|T\d+)|[A-Za-z0-9_ -]+?)\s+(?:as\s+|to\s+)?(?P<status>todo|in\s+progress|in_progress|done|completed|finished)\s*[!.?]*\s*$",
+    re.IGNORECASE,
+)
+DIRECT_LIST_TASKS_RE = re.compile(
+    r"^\s*(?:list\s+tasks|what\s+are\s+the\s+tasks|show\s+tasks|tasks)\s*[?!.]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _direct_task_command_answer(question, guild_id, discord):
+    """Direct, deterministic task commands that execute immediately without requiring LLM quota."""
+    if DIRECT_LIST_TASKS_RE.match(question):
+        tasks = _all_tasks(guild_id)
+        if not tasks:
+            return "There are no tasks tracked in this server's graph yet."
+        grouped = _aggregate_task_rows(tasks)
+        lines = ["**Tasks in this server:**"]
+        for tid, title, owners, status, _ in grouped:
+            owner_str = f" ({', '.join(owners)})" if owners else " (unassigned)"
+            status_str = f" [{status}]" if status and status != "todo" else ""
+            lines.append(f"- **{tid}**: {title}{owner_str}{status_str}")
+        return "\n".join(lines)
+
+    provenance = _discord_provenance(discord, guild_id, question)
+    author = (discord or {}).get("author_name") or "someone"
+    if provenance is None:
+        # No valid Discord source — let the Gemini path handle it with a consistent error message
+        return None
+
+    match = DIRECT_CREATE_TASK_RE.match(question)
+    if match:
+        title = match.group("title").strip()
+        raw_dev = match.group("dev").strip() if match.group("dev") else None
+        graph = tenant_graph(guild_id)
+        dev = _clean_developer_name(raw_dev, graph)
+        if raw_dev and not dev:
+            title = f"{title} for {raw_dev}"
+
+        if not title or len(title) < 2 or title.casefold().startswith("for "):
+            return "Please provide a valid task title to create a task."
+
+        change = TaskChange(action="create", title=title, developer=dev)
+        try:
+            applied_summary = _apply_change(guild_id, change, author, provenance)
+            return f"- {applied_summary}"
+        except Exception as exc:
+            log.exception("Direct task creation failed: %s", exc)
+            return "Couldn't create task due to an internal error. Please try again."
+
+    match = DIRECT_ASSIGN_RE.match(question)
+    if match:
+        task_ref = match.group("task").strip()
+        raw_dev = match.group("dev").strip()
+        graph = tenant_graph(guild_id)
+        dev = _clean_developer_name(raw_dev, graph)
+        if not dev:
+            return f"I couldn't identify '{raw_dev}' as a developer. Please name a person to assign to."
+        task_id = _resolve_task(guild_id, task_ref)
+        if not task_id:
+            return f"I couldn't find a task matching '{task_ref}'."
+        change = TaskChange(action="assign", task_id=task_id, developer=dev)
+        try:
+            applied_summary = _apply_change(guild_id, change, author, provenance)
+            return f"- {applied_summary}"
+        except Exception as exc:
+            log.exception("Direct task assign failed: %s", exc)
+            return "Couldn't assign task due to an internal error. Please try again."
+
+    match = DIRECT_STATUS_RE.match(question)
+    if match:
+        task_ref = match.group("task").strip()
+        raw_status = match.group("status").strip().lower()
+        if raw_status in ("completed", "finished", "done"):
+            status_val = "done"
+        elif raw_status in ("in progress", "in_progress"):
+            status_val = "in_progress"
+        else:
+            status_val = "todo"
+        task_id = _resolve_task(guild_id, task_ref)
+        if not task_id:
+            return f"I couldn't find a task matching '{task_ref}'."
+        change = TaskChange(action="set_status", task_id=task_id, status=status_val)
+        try:
+            applied_summary = _apply_change(guild_id, change, author, provenance)
+            return f"- {applied_summary}"
+        except Exception as exc:
+            log.exception("Direct task status update failed: %s", exc)
+            return "Couldn't update status due to an internal error. Please try again."
+
+    return None
+
+
 @app.post("/investigate")
 def investigate(req: InvestigateRequest):
+
     discord = req.discord or {}
     if HELP_RE.match(req.question):
         return {"answer": HELP_TEXT}
     # Requests from outside Discord (e.g. curl) use the default server
     server_id = discord.get("guild_id") if req.discord else os.getenv("DISCORD_GUILD_ID")
     if server_id:
-        for command in (_sync_answer, _teams_answer):
+        for command in (_sync_answer, _teams_answer, _gc_answer):
             command_answer = command(req.question, server_id)
             if command_answer is not None:
                 return {"answer": command_answer}
@@ -1401,6 +1813,9 @@ def investigate(req: InvestigateRequest):
     ownership_answer = _ownership_provenance_answer(req.question, guild_id, tasks)
     if ownership_answer is not None:
         return {"answer": ownership_answer}
+    task_command_answer = _direct_task_command_answer(req.question, guild_id, discord)
+    if task_command_answer is not None:
+        return {"answer": task_command_answer}
     gemini = _gemini_client()
     if gemini:
         try:
@@ -1433,7 +1848,7 @@ def investigate(req: InvestigateRequest):
                     target = (" ".join(filter(None, [change.developer, change.team, change.github_login]))
                               if change.action in ("join_team", "leave_team", "link_github")
                               else " ".join(filter(None, [change.task_id, change.title])) or "task")
-                    lines.append(f"- Couldn't {change.action.replace('_', ' ')} {target}: {exc}")
+                    lines.append(f"- Couldn't {change.action.replace('_', ' ')} {target}: invalid request or task not found.")
             answer = reply.answer.strip()
             if applied and "?" in req.question:
                 try:

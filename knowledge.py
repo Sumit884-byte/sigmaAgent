@@ -104,13 +104,17 @@ def fulltext_query(text: str) -> str:
 
 
 def mentioned_tasks(text: str, tasks: list[tuple[str, str]]) -> list[str]:
-    """Task IDs referenced in text by ID (T3) or by their full title as a whole phrase."""
+    """Task IDs referenced in text by ID (e.g. T3, ENG-123, PROJ-42) or by their full title."""
     found = set()
-    ids = {task_id.upper() for task_id, _ in tasks}
-    for match in re.findall(r"\bT\d+\b", text or "", flags=re.IGNORECASE):
-        if match.upper() in ids:
-            found.add(match.upper())
+    ids_map = {task_id.upper(): task_id for task_id, _ in tasks}
+    # Match standard patterns like T12, ENG-123, AB2-12, PROJ-456, etc.
+    for match in re.findall(r"\b[A-Za-z][A-Za-z0-9]*-\d+\b|\bT\d+\b", text or "", flags=re.IGNORECASE):
+        if match.upper() in ids_map:
+            found.add(ids_map[match.upper()])
+    # Also directly check if any task ID in tasks is explicitly mentioned with token boundaries
     for task_id, title in tasks:
+        if task_id and re.search(rf"(?<![\w-]){re.escape(task_id)}(?![\w-])", text or "", re.IGNORECASE):
+            found.add(task_id)
         if title and len(title) >= 3 and re.search(rf"(?<!\w){re.escape(title)}(?!\w)", text or "", re.IGNORECASE):
             found.add(task_id)
     return sorted(found)
@@ -196,7 +200,8 @@ UNWIND row.files AS f
 MERGE (file:File {key: $repo + ':' + f.path})
 SET file.path = f.path, file.repo = $repo, file.url = f.url
 MERGE (c)-[t:TOUCHES]->(file)
-SET t.additions = f.additions, t.deletions = f.deletions
+SET t.additions = CASE WHEN f.additions > 0 THEN f.additions ELSE coalesce(t.additions, 0) END,
+    t.deletions = CASE WHEN f.deletions > 0 THEN f.deletions ELSE coalesce(t.deletions, 0) END
 """
 
 ISSUE_UPSERT = """

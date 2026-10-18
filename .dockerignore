@@ -8,7 +8,6 @@
 .github/
 
 # Other services have their own images
-context retrieval/
 discord-bot/
 website/
 tests/
