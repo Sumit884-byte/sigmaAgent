@@ -7,7 +7,6 @@
   <a href="#-features"><img src="https://img.shields.io/badge/Features-3B82F6?style=for-the-badge&logo=sparkles&logoColor=white" alt="Features" /></a>
   <a href="#-architecture"><img src="https://img.shields.io/badge/Architecture-10B981?style=for-the-badge&logo=diagram&logoColor=white" alt="Architecture" /></a>
   <a href="#-api-reference"><img src="https://img.shields.io/badge/API_Docs-F59E0B?style=for-the-badge&logo=swagger&logoColor=white" alt="API Docs" /></a>
-  <a href="#-contributors"><img src="https://img.shields.io/badge/Team-EC4899?style=for-the-badge&logo=github&logoColor=white" alt="Team" /></a>
 </p>
 
 <p align="center">
@@ -179,6 +178,8 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
+pip install -r "context retrieval/requirements.txt"
+pip install -r discord-bot/requirements.txt
 ```
 
 ### 2️⃣ Configure Environment
@@ -187,14 +188,15 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` with your credentials:
+Edit `.env` with your credentials. A local FalkorDB uses port `6379`. A FalkorDB Cloud instance uses the host and port from the cloud dashboard (often not `6379`).
 
 ```env
-# FalkorDB
-FALKORDB_HOST=your-host.cloud
+# FalkorDB — local defaults shown; replace host and port for cloud
+FALKORDB_HOST=127.0.0.1
 FALKORDB_PORT=6379
 FALKORDB_USERNAME=falkordb
 FALKORDB_PASSWORD=your-password
+FALKORDB_GRAPH=SigmaCompanyBrain
 FALKORDB_GRAPH_PREFIX=Sigma_
 
 # Discord
@@ -207,6 +209,8 @@ GEMINI_API_KEY=your-gemini-key
 # Internal API Security
 INVESTIGATION_API_KEY=generate-a-strong-random-key
 INVESTIGATION_API_URL=http://localhost:8000/investigate
+CONTEXT_API_URL=http://127.0.0.1:8001
+CONTEXT_API_KEY=generate-a-strong-random-key
 ```
 
 ### 3️⃣ Start the Backend
@@ -215,12 +219,28 @@ INVESTIGATION_API_URL=http://localhost:8000/investigate
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
+In a second terminal, start the context retrieval API:
+
+```bash
+uvicorn api:app --host 127.0.0.1 --port 8001 --app-dir "context retrieval"
+```
+
 ### 4️⃣ Start the Discord Bot
 
 ```bash
 cd discord-bot
 python bot.py
 ```
+
+### 5️⃣ Start the Website (optional)
+
+```bash
+cd website
+npm install
+npm run dev
+```
+
+The Next.js app listens on [http://localhost:3000](http://localhost:3000).
 
 ### 🐳 Docker (Alternative)
 
@@ -385,6 +405,8 @@ sigmaAgent/
 ## 🧪 Running Tests
 
 ```bash
+pip install pytest
+
 # Run the full test suite
 python -m pytest tests/ -v
 
@@ -453,59 +475,6 @@ Contributions are welcome! Here's how to get started:
 
 <br />
 
-## 👥 Contributors
-
-A huge thanks to the team behind **SigmaAgent**:
-
-<p align="center">
-  <a href="https://github.com/Sumit884-byte/sigmaAgent/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=Sumit884-byte/sigmaAgent" alt="SigmaAgent Contributors" />
-  </a>
-</p>
-
-<table>
-  <tr>
-    <td align="center" width="25%">
-      <a href="https://github.com/Sumit884-byte">
-        <img src="https://github.com/Sumit884-byte.png" width="90px;" style="border-radius:50%;" alt="Sumit Mishra"/><br />
-        <sub><b>Sumit Mishra</b></sub>
-      </a><br />
-      <sub><code>@Sumit884-byte</code></sub><br />
-      <small>Core Agent & Graph Architecture</small>
-    </td>
-    <td align="center" width="25%">
-      <a href="https://github.com/kawaresrishti">
-        <img src="https://github.com/kawaresrishti.png" width="90px;" style="border-radius:50%;" alt="Srushti Kaware"/><br />
-        <sub><b>Srushti Kaware</b></sub>
-      </a><br />
-      <sub><code>@kawaresrishti</code></sub><br />
-      <small>Database & Ingestion Pipeline</small>
-    </td>
-    <td align="center" width="25%">
-      <a href="https://github.com/soma0212">
-        <img src="https://github.com/soma0212.png" width="90px;" style="border-radius:50%;" alt="Soma Datta"/><br />
-        <sub><b>Soma Datta</b></sub>
-      </a><br />
-      <sub><code>@soma0212</code></sub><br />
-      <small>Context Retrieval & Sync Engine</small>
-    </td>
-    <td align="center" width="25%">
-      <a href="https://github.com/gitseraj12">
-        <img src="https://github.com/gitseraj12.png" width="90px;" style="border-radius:50%;" alt="Seraj"/><br />
-        <sub><b>Seraj</b></sub>
-      </a><br />
-      <sub><code>@gitseraj12</code></sub><br />
-      <small>Discord Bot & UI Integration</small>
-    </td>
-  </tr>
-</table>
-
-<br />
-
----
-
-<br />
-
 ## 📄 License
 
 This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
@@ -519,7 +488,6 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 </p>
 
 <p align="center">
-  <sub>Built with ❤️ by <a href="https://github.com/Sumit884-byte">Sumit Mishra</a> · <a href="https://github.com/kawaresrishti">Srushti Kaware</a> · <a href="https://github.com/soma1111111">Soma Datta</a> · <a href="https://github.com/gitseraj12">Seraj</a></sub><br />
   <sub>Powered by <b>FalkorDB</b> · <b>Gemini AI</b> · <b>FastAPI</b> · <b>Discord.py</b></sub>
 </p>
 
