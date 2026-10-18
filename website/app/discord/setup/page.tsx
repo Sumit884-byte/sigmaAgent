@@ -13,7 +13,7 @@ export default function DiscordSetupPage() {
         <p className="eyebrow">CONNECT YOUR TEAM</p>
         <h1 id="discord-setup-title">Add SigmaAgent to Discord</h1>
         <p className="workspace-intro">
-          The bot uses the same investigation service as this workspace. To create the server install link, set
+          The bot answers from your team&apos;s task graph, chat history and docs. To create the server install link, set
           <code> DISCORD_APPLICATION_ID </code> in <code>website/.env</code>, or set a real invite URL with
           <code> DISCORD_INVITE_URL</code>, then restart the website.
         </p>
@@ -24,7 +24,7 @@ export default function DiscordSetupPage() {
           </div>
         </div>
         <p className="workspace-footnote">The bot needs permission to view channels, read message history, and send replies. Message Content Intent must also be enabled in the Discord Developer Portal.</p>
-        <p><Link className="button-secondary" href="/workspace">Return to the investigation workspace →</Link></p>
+        <p><Link className="button-secondary" href="/">Return to the home page →</Link></p>
       </section>
     </main>
   );

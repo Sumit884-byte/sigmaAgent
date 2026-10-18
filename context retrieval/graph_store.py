@@ -22,6 +22,7 @@ RANGE_INDEXES = {
     "ContextEvidence": ("id",),
     "Task": ("id",),
     "DiscordSyncState": ("channel_id",),
+    "DiscordSyncWatermark": ("channel_id",),
 }
 _GRAPH_CACHE: dict[tuple[str, int, str | None, str | None, str], Any] = {}
 _GRAPH_CACHE_LOCK = threading.Lock()
@@ -269,6 +270,27 @@ def latest_message_id(graph: Any, channel_id: str) -> str | None:
         {"channel_id": channel_id},
     )
     return str(result.result_set[0][0]) if result.result_set and result.result_set[0][0] else None
+
+
+def sync_watermark(graph: Any, channel_id: str) -> str | None:
+    """The newest message ID that history sync has fully caught up to.
+
+    Live-streamed messages are stored too, but they must not move this mark: otherwise
+    messages posted while the bot was offline would sit below the newest streamed one
+    and never be fetched.
+    """
+    result = graph.query(
+        "MATCH (w:DiscordSyncWatermark {channel_id: $channel_id}) RETURN w.synced_through LIMIT 1",
+        {"channel_id": channel_id},
+    )
+    return str(result.result_set[0][0]) if result.result_set and result.result_set[0][0] else None
+
+
+def save_sync_watermark(graph: Any, channel_id: str, message_id: str) -> None:
+    graph.query(
+        "MERGE (w:DiscordSyncWatermark {channel_id: $channel_id}) SET w.synced_through = $message_id",
+        {"channel_id": channel_id, "message_id": message_id},
+    )
 
 
 def oldest_message_id(graph: Any, channel_id: str) -> str | None:

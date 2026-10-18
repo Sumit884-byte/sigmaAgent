@@ -10,6 +10,16 @@ from unittest.mock import patch
 import falkordb
 from fastapi.testclient import TestClient
 
+# /investigate requires the internal key, like the bot and the website proxy send
+TEST_INVESTIGATION_KEY = "test-investigation-key"
+AUTH_HEADERS = {"Authorization": f"Bearer {TEST_INVESTIGATION_KEY}"}
+
+
+def use_test_investigation_key(test_case):
+    patcher = patch.dict(os.environ, {"INVESTIGATION_API_KEY": TEST_INVESTIGATION_KEY})
+    patcher.start()
+    test_case.addCleanup(patcher.stop)
+
 
 class QueryResult:
     def __init__(self, result_set):
@@ -113,7 +123,8 @@ class ChangeProvenanceTests(unittest.TestCase):
         # Every server's graph resolves to the recording fake
         self.original_tenant_graph = api.tenant_graph
         api.tenant_graph = lambda _guild_id: self.graph
-        self.client = TestClient(api.app)
+        use_test_investigation_key(self)
+        self.client = TestClient(api.app, headers=AUTH_HEADERS)
         self.discord = {
             "guild_id": "123456789012345678",
             "channel_id": "234567890123456789",
@@ -356,7 +367,8 @@ class FalkorDbProvenanceIntegrationTests(unittest.TestCase):
         source_message_id = str(500000000000000000 + uuid.uuid4().int % 300000000000000000)
         actor_id = str(800000000000000000 + uuid.uuid4().int % 100000000000000000)
         api.tenant_graph = lambda _guild_id: graph
-        client = TestClient(api.app)
+        use_test_investigation_key(self)
+        client = TestClient(api.app, headers=AUTH_HEADERS)
         try:
             graph.query(
                 "CREATE (:Task {id: $id, guild_id: $g, title: 'Build LLM Agent', status: 'todo'})",
@@ -474,7 +486,8 @@ class FalkorDbDependencyPathIntegrationTests(unittest.TestCase):
         ).select_graph(graph_name)
         guild_id = "123456789012345678"
         api.tenant_graph = lambda _guild_id: graph
-        client = TestClient(api.app)
+        use_test_investigation_key(self)
+        client = TestClient(api.app, headers=AUTH_HEADERS)
         try:
             graph.query("""
                 CREATE (t5:Task {id: 'T5', guild_id: $g, title: 'Build LLM Agent', status: 'todo'}),
@@ -594,7 +607,8 @@ class AnswerWithSourcesTests(unittest.TestCase):
         self.graph.tasks = [["T5", "Build LLM Agent", "Person 4", None, "todo"]]
         self.original_tenant_graph = api.tenant_graph
         api.tenant_graph = lambda _guild_id: self.graph
-        self.client = TestClient(api.app)
+        use_test_investigation_key(self)
+        self.client = TestClient(api.app, headers=AUTH_HEADERS)
         self.discord = {
             "guild_id": "123456789012345678",
             "channel_id": "234567890123456789",

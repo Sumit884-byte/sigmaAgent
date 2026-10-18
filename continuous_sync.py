@@ -236,9 +236,14 @@ def handle_github_webhook(graph: Any, event_name: str, payload: dict[str, Any]) 
             "assignees": assignees,
         }
 
-        graph.query(knowledge.ISSUE_UPSERT, {"repo": repo, "rows": [row]})
-        task_links = [{"source": key, "target": tid} for tid in knowledge.mentioned_tasks(f"{title}\n{body}", tasks)]
-        knowledge._link(graph, "Issue", task_links)
+        if payload.get("action") in ("deleted", "transferred"):
+            # Gone from this repo: remove it rather than re-adding it
+            graph.query("MATCH (i:Issue {key: $key}) DETACH DELETE i", {"key": key})
+            state = "removed"
+        else:
+            graph.query(knowledge.ISSUE_UPSERT, {"repo": repo, "rows": [row]})
+            task_links = [{"source": key, "target": tid} for tid in knowledge.mentioned_tasks(f"{title}\n{body}", tasks)]
+            knowledge._link(graph, "Issue", task_links)
 
         stats["number"] = number
         stats["action"] = payload.get("action")
@@ -553,6 +558,11 @@ class BackgroundKnowledgeSyncer:
     def start(self) -> None:
         if self.running or self.interval_seconds <= 0:
             return
+        if not (os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")):
+            # Each sync makes ~25 GitHub calls; unauthenticated GitHub allows 60 an hour per IP,
+            # so automatic syncs would starve live GitHub answers. `sync github` still works on demand.
+            log.warning("Background knowledge syncer not started: set GITHUB_TOKEN to enable automatic syncs")
+            return
         self.running = True
         self.task = asyncio.create_task(self._run_loop())
         log.info("Background knowledge syncer started with %ds interval", self.interval_seconds)
@@ -567,14 +577,14 @@ class BackgroundKnowledgeSyncer:
     async def sync_now(self, run_gc: bool = False) -> dict[str, Any]:
         """Execute a synchronization cycle immediately, optionally running garbage collection."""
         try:
-            graph = self.graph_provider()
+            # The first call connects to FalkorDB and creates indexes: keep it off the event loop
+            graph = await asyncio.to_thread(self.graph_provider)
             if not graph:
                 return {"status": "skipped", "reason": "no graph available"}
 
-            # Sync default repo
+            # Sync default repo (sync_repository already rebuilds expertise)
             repo = self.default_repo
             result = await asyncio.to_thread(knowledge.sync_repository, graph, repo)
-            await asyncio.to_thread(knowledge.refresh_expertise, graph)
 
             self.last_sync_time = _now()
             self.last_sync_result = result
@@ -602,7 +612,7 @@ class BackgroundKnowledgeSyncer:
     async def run_gc(self, max_message_age_days: int | None = None) -> dict[str, Any]:
         """Execute garbage collection directly."""
         try:
-            graph = self.graph_provider()
+            graph = await asyncio.to_thread(self.graph_provider)
             if not graph:
                 return {"status": "skipped", "reason": "no graph available"}
             result = await asyncio.to_thread(
@@ -621,14 +631,18 @@ class BackgroundKnowledgeSyncer:
     async def _run_loop(self) -> None:
         # Initial brief wait after server boot
         await asyncio.sleep(min(10, self.interval_seconds))
+        failures = 0
         while self.running:
             try:
-                await self.sync_now()
+                outcome = await self.sync_now()
+                failures = failures + 1 if outcome.get("status") == "error" else 0
             except asyncio.CancelledError:
                 break
             except Exception as exc:
+                failures += 1
                 log.exception("Unexpected error in background syncer loop: %s", exc)
-            await asyncio.sleep(self.interval_seconds)
+            # Back off after failures (missing repo, rate limit) instead of retrying every cycle
+            await asyncio.sleep(min(self.interval_seconds * (2 ** min(failures, 6)), 3600))
 
     def get_status(self) -> dict[str, Any]:
         return {

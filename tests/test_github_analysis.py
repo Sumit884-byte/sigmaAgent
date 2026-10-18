@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import os
+
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import falkordb
 from fastapi.testclient import TestClient
+
+# /investigate requires the internal key, like the bot and the website proxy send
+TEST_INVESTIGATION_KEY = "test-investigation-key"
+AUTH_HEADERS = {"Authorization": f"Bearer {TEST_INVESTIGATION_KEY}"}
+
+
+def use_test_investigation_key(test_case):
+    patcher = patch.dict(os.environ, {"INVESTIGATION_API_KEY": TEST_INVESTIGATION_KEY})
+    patcher.start()
+    test_case.addCleanup(patcher.stop)
 
 import github_analysis
 from github_analysis import (
@@ -441,7 +453,8 @@ class GitHubApiRouteTests(unittest.TestCase):
 
     def setUp(self):
         github_analysis._CACHE.clear()
-        self.client = TestClient(api.app)
+        use_test_investigation_key(self)
+        self.client = TestClient(api.app, headers=AUTH_HEADERS)
 
     def test_investigate_answers_github_question_without_a_guild(self):
         with patch.object(github_analysis, "_http_get_json",

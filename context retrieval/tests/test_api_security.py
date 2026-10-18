@@ -97,11 +97,12 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
         }), patch("api._fetch_channel", return_value={"id": channel_id, "guild_id": "323456789012345678"}), \
              patch("api._fetch_messages", side_effect=fetch_messages), \
              patch("api.connect_graph", return_value=object()), \
-             patch("api.latest_message_id", return_value="100"), \
+             patch("api.sync_watermark", return_value="100"), \
              patch("api.oldest_message_id", return_value="100"), \
              patch("api.sync_progress", side_effect=[None, progress[0], progress[1]]), \
              patch("api.import_messages", side_effect=fake_import), \
-             patch("api.save_sync_progress") as save_progress:
+             patch("api.save_sync_progress") as save_progress, \
+             patch("api.save_sync_watermark") as save_watermark:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://test"
             ) as client:
@@ -122,6 +123,9 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(imported_ids), {str(value) for value in range(101, 351)})
         self.assertEqual(len(imported_ids), len(set(imported_ids)))
         self.assertEqual(save_progress.call_count, 3)
+        # The sync-only watermark advances once, when the catch-up finishes, to the newest synced message
+        save_watermark.assert_called_once()
+        self.assertEqual(save_watermark.call_args.args[1:], (channel_id, "350"))
 
     async def test_retrieve_rejects_malformed_channel_id_via_request_model(self) -> None:
         with patch.dict(os.environ, {
@@ -163,7 +167,7 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
             "DISCORD_ALLOWED_CHANNEL_IDS": channel_id,
         }), patch("api._fetch_channel", return_value={"id": channel_id}), \
              patch("api.connect_graph", return_value=object()), \
-             patch("api.latest_message_id", side_effect=RuntimeError("private database credential")), \
+             patch("api.sync_watermark", side_effect=RuntimeError("private database credential")), \
              patch("api.logger.exception"):
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -179,3 +183,15 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NonAsciiKeyTests(unittest.TestCase):
+    def test_non_ascii_api_key_is_rejected_not_a_crash(self):
+        from fastapi import HTTPException
+
+        from api import require_context_api_key
+
+        with patch.dict(os.environ, {"CONTEXT_API_KEY": "k" * 40}):
+            with self.assertRaises(HTTPException) as raised:
+                require_context_api_key("café-" + "k" * 35)
+        self.assertEqual(raised.exception.status_code, 401)
