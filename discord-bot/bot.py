@@ -98,9 +98,25 @@ async def investigate(question: str, message: discord.Message) -> str:
         return extract_answer(data)
 
 
+def is_channel_allowed(channel_id: str | int | None) -> bool:
+    """Respect the channel allowlist configured in context retrieval to honor hackathon data rules."""
+    if not channel_id:
+        return False
+    raw = os.getenv("DISCORD_ALLOWED_CHANNEL_IDS", "").strip()
+    if not raw:
+        return False
+    if raw == "*":
+        return True
+    allowed = {x.strip() for x in raw.split(",") if x.strip()}
+    return str(channel_id).strip() in allowed
+
+
 async def stream_message_to_graph(message: discord.Message) -> None:
     """Asynchronously stream a Discord message to the company brain graph in real time."""
     if not DISCORD_STREAM_URL or message.author.bot:
+        return
+    if not is_channel_allowed(message.channel.id):
+        log.debug("Channel %s is not allowlisted; skipping real-time message streaming.", message.channel.id)
         return
     payload = {
         "guild_id": str(message.guild.id) if message.guild else None,
@@ -225,6 +241,8 @@ async def on_message(message: discord.Message):
 @client.event
 async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     """Keep the graph current when a user edits their Discord message."""
+    if not is_channel_allowed(payload.channel_id):
+        return
     data = payload.data or {}
     new_content = data.get("content")
     if new_content and payload.message_id:
@@ -235,6 +253,8 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 @client.event
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     """Keep the graph current when a user deletes their Discord message."""
+    if not is_channel_allowed(payload.channel_id):
+        return
     if payload.message_id:
         guild_id = str(payload.guild_id) if payload.guild_id else None
         asyncio.create_task(stream_message_delete_to_graph(str(payload.message_id), guild_id))

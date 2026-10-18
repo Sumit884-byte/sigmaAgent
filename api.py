@@ -1,7 +1,10 @@
+import asyncio
+import hashlib
+import hmac
+import json
+import logging
 import os
 import re
-import hashlib
-import json
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -14,6 +17,8 @@ from falkordb import FalkorDB
 from google import genai
 from google.genai import errors as genai_errors
 from pydantic import BaseModel
+
+log = logging.getLogger("api")
 
 import continuous_sync
 from continuous_sync import (
@@ -46,14 +51,32 @@ def _gemini_client():
     return genai.Client(api_key=key) if key else None
 
 
-# 1. Database Credentials
-CLOUD_HOST = os.getenv("FALKORDB_HOST", "r-6jissuruar.instance-gijzjhvh6.hc-7up0crkyn.ap-south-1.aws.f2e0a955bb84.cloud")
-CLOUD_PORT = int(os.getenv("FALKORDB_PORT", 52078))
-CLOUD_USERNAME = os.getenv("FALKORDB_USERNAME", "falkordb")
-CLOUD_PASSWORD = os.getenv("FALKORDB_PASSWORD", "password")
+# 1. Database Credentials and lazy connection
+_db: FalkorDB | None = None
 
-# 2. Connect to database
-db = FalkorDB(host=CLOUD_HOST, port=CLOUD_PORT, username=CLOUD_USERNAME, password=CLOUD_PASSWORD)
+
+def get_db() -> FalkorDB:
+    global _db
+    if _db is None:
+        host = os.getenv("FALKORDB_HOST", "localhost")
+        port = int(os.getenv("FALKORDB_PORT", 6379))
+        username = os.getenv("FALKORDB_USERNAME")
+        password = os.getenv("FALKORDB_PASSWORD")
+        _db = FalkorDB(host=host, port=port, username=username, password=password)
+    return _db
+
+
+class _LazyDBProxy:
+    """Lazy proxy so importing api.py does not initiate an immediate network connection."""
+
+    def select_graph(self, name: str):
+        return get_db().select_graph(name)
+
+    def __getattr__(self, name: str):
+        return getattr(get_db(), name)
+
+
+db = _LazyDBProxy()
 
 # Each Discord server gets its own FalkorDB graph, so its tasks, people and chat history never mix
 # with another server's, and graph algorithms (PageRank, WCC) only ever see one team's work
@@ -214,11 +237,17 @@ def knowledge_sync(req: KnowledgeSyncRequest, request: Request):
 def _verify_internal_api_key(request: Request) -> None:
     expected_key = os.getenv("INVESTIGATION_API_KEY", "").strip()
     if not expected_key:
-        return
+        raise HTTPException(
+            status_code=503,
+            detail="Investigation API key is not configured on the server",
+        )
     auth_header = request.headers.get("Authorization") or ""
     api_key_header = request.headers.get("X-API-Key") or ""
     token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else auth_header.strip()
-    if token != expected_key and api_key_header != expected_key:
+    expected_bytes = expected_key.encode("utf-8")
+    token_valid = hmac.compare_digest(token.encode("utf-8"), expected_bytes) if token else False
+    header_valid = hmac.compare_digest(api_key_header.strip().encode("utf-8"), expected_bytes) if api_key_header else False
+    if not (token_valid or header_valid):
         raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing API key")
 
 
@@ -242,7 +271,7 @@ def _resolve_guild_for_repo(repo: str, request: Request | None = None) -> str:
             if custom:
                 return str(custom)
 
-    return "1"
+    raise ValueError(f"Repository {repo!r} is not mapped to any known Discord guild")
 
 
 @app.post("/webhooks/github")
@@ -261,29 +290,35 @@ async def github_webhook(request: Request):
     try:
         payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Malformed JSON payload: {exc}") from exc
+        raise HTTPException(status_code=400, detail="Malformed JSON payload") from exc
 
     repo_data = payload.get("repository") or {}
     repo = repo_data.get("full_name") or ""
-    guild_id = _resolve_guild_for_repo(repo, request)
+    try:
+        guild_id = _resolve_guild_for_repo(repo, request)
+    except ValueError as exc:
+        log.warning("Unmapped repo in webhook: %s", exc)
+        raise HTTPException(status_code=400, detail="Repository is not mapped to any known Discord guild") from exc
+
     try:
         graph = tenant_graph(guild_id)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid target graph: {exc}") from exc
+        raise HTTPException(status_code=400, detail="Invalid target graph or server configuration") from exc
 
     try:
-        result = handle_github_webhook(graph, event, payload)
+        result = await asyncio.to_thread(handle_github_webhook, graph, event, payload)
         background_syncer.webhook_events_count += 1
         return result
     except GitHubNotFound as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail="Repository not found") from exc
     except GitHubUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(status_code=503, detail="GitHub API unavailable") from exc
 
 
 @app.get("/knowledge/sync/status")
-def knowledge_sync_status():
+def knowledge_sync_status(request: Request):
     """Inspect background knowledge syncer health, stats, and webhook event counts."""
+    _verify_internal_api_key(request)
     return background_syncer.get_status()
 
 
@@ -323,13 +358,14 @@ class GraphGCRequest(BaseModel):
 
 
 @app.post("/discord/stream-message")
-def discord_stream_message(req: DiscordStreamMessageRequest):
+def discord_stream_message(req: DiscordStreamMessageRequest, request: Request):
     """Ingest a live Discord message into the server's graph in real time."""
+    _verify_internal_api_key(request)
     guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "1")
     try:
         graph = tenant_graph(guild_id)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid target graph: {exc}") from exc
+        raise HTTPException(status_code=400, detail="Invalid target graph or server configuration") from exc
 
     payload = req.model_dump()
     result = handle_discord_stream_message(graph, payload)
@@ -338,38 +374,41 @@ def discord_stream_message(req: DiscordStreamMessageRequest):
 
 
 @app.put("/discord/stream-message/{message_id}")
-def discord_stream_message_edit(message_id: str, req: DiscordMessageEditRequest):
+def discord_stream_message_edit(message_id: str, req: DiscordMessageEditRequest, request: Request):
     """Update a live Discord message's content in the server's graph in real time."""
+    _verify_internal_api_key(request)
     guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "1")
     try:
         graph = tenant_graph(guild_id)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid target graph: {exc}") from exc
+        raise HTTPException(status_code=400, detail="Invalid target graph or server configuration") from exc
 
     return handle_discord_message_edit(graph, message_id, req.content, req.edited_at)
 
 
 @app.delete("/discord/stream-message/{message_id}")
-def discord_stream_message_delete(message_id: str, guild_id: str | None = None, soft_delete: bool = True):
+def discord_stream_message_delete(message_id: str, request: Request, guild_id: str | None = None, soft_delete: bool = True):
     """Delete or soft-delete a Discord message in the server's graph."""
+    _verify_internal_api_key(request)
     gid = guild_id or os.getenv("DISCORD_GUILD_ID", "1")
     try:
         graph = tenant_graph(gid)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid target graph: {exc}") from exc
+        raise HTTPException(status_code=400, detail="Invalid target graph or server configuration") from exc
 
     return handle_discord_message_delete(graph, message_id, soft_delete=soft_delete)
 
 
 @app.post("/knowledge/gc")
-def knowledge_gc(req: GraphGCRequest | None = None):
+def knowledge_gc(request: Request, req: GraphGCRequest | None = None):
     """Run graph garbage collection to prune disconnected sections, files, topics, and stale messages."""
+    _verify_internal_api_key(request)
     req = req or GraphGCRequest()
     guild_id = req.guild_id or os.getenv("DISCORD_GUILD_ID", "1")
     try:
         graph = tenant_graph(guild_id)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid target graph: {exc}") from exc
+        raise HTTPException(status_code=400, detail="Invalid target graph or server configuration") from exc
 
     stats = prune_graph_garbage(
         graph,
@@ -386,8 +425,9 @@ def knowledge_gc(req: GraphGCRequest | None = None):
 
 
 @app.get("/knowledge/gc/status")
-def knowledge_gc_status():
+def knowledge_gc_status(request: Request):
     """Get the latest garbage collection metrics."""
+    _verify_internal_api_key(request)
     return {
         "total_gc_count": background_syncer.total_gc_count,
         "last_gc_time": background_syncer.last_gc_time,
@@ -797,18 +837,10 @@ def _sync_answer(question, guild_id):
 def _gc_answer(question, guild_id):
     if not GC_RE.match(question):
         return None
-    graph = tenant_graph(guild_id)
-    stats = prune_graph_garbage(graph)
-    background_syncer.total_gc_count += 1
-    background_syncer.last_gc_time = datetime.now(timezone.utc).isoformat()
-    background_syncer.last_gc_result = stats
     return (
-        f"**Graph Garbage Collection complete:**\n"
-        f"- Pruned orphan doc sections: {stats['pruned_doc_sections']}\n"
-        f"- Pruned orphan files: {stats['pruned_files']}\n"
-        f"- Pruned unreferenced topics: {stats['pruned_topics']}\n"
-        f"- Pruned deleted messages: {stats['pruned_deleted_messages']}\n"
-        f"- Total elements cleaned: {stats['total_pruned']}"
+        "Garbage collection modifies graph state and cannot be run via regular chat commands. "
+        "To maintain read-only safety, garbage collection must be executed through the authenticated "
+        "administration endpoint `/knowledge/gc` with explicit parameters."
     )
 
 
@@ -1690,7 +1722,8 @@ def _direct_task_command_answer(question, guild_id, discord):
             applied_summary = _apply_change(guild_id, change, author, provenance)
             return f"- {applied_summary}"
         except Exception as exc:
-            return f"Couldn't create task: {exc}"
+            log.exception("Direct task creation failed: %s", exc)
+            return "Couldn't create task due to an internal error. Please try again."
 
     match = DIRECT_ASSIGN_RE.match(question)
     if match:
@@ -1708,7 +1741,8 @@ def _direct_task_command_answer(question, guild_id, discord):
             applied_summary = _apply_change(guild_id, change, author, provenance)
             return f"- {applied_summary}"
         except Exception as exc:
-            return f"Couldn't assign task: {exc}"
+            log.exception("Direct task assign failed: %s", exc)
+            return "Couldn't assign task due to an internal error. Please try again."
 
     match = DIRECT_STATUS_RE.match(question)
     if match:
@@ -1728,7 +1762,8 @@ def _direct_task_command_answer(question, guild_id, discord):
             applied_summary = _apply_change(guild_id, change, author, provenance)
             return f"- {applied_summary}"
         except Exception as exc:
-            return f"Couldn't update status: {exc}"
+            log.exception("Direct task status update failed: %s", exc)
+            return "Couldn't update status due to an internal error. Please try again."
 
     return None
 

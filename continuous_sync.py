@@ -13,12 +13,25 @@ import logging
 import os
 import re
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+import sys
 from typing import Any, Callable
 
 import httpx
 
 import knowledge
 from github_analysis import GitHubNotFound, GitHubUnavailable, is_safe_repo
+
+_CR_DIR = Path(__file__).resolve().parent / "context retrieval"
+if str(_CR_DIR) not in sys.path:
+    sys.path.insert(0, str(_CR_DIR))
+
+try:
+    from models import DiscordMessage  # type: ignore
+    from graph_store import import_messages  # type: ignore
+except ImportError:
+    DiscordMessage = None  # type: ignore
+    import_messages = None  # type: ignore
 
 log = logging.getLogger("continuous_sync")
 
@@ -75,6 +88,14 @@ def handle_github_webhook(graph: Any, event_name: str, payload: dict[str, Any]) 
     )
 
     tasks = [(row[0], row[1]) for row in graph.ro_query("MATCH (t:Task) RETURN t.id, t.title").result_set]
+    if not tasks:
+        log.info("Graph has no tasks; skipping full webhook processing for %s", repo)
+        return {
+            "status": "skipped",
+            "reason": "graph holds no tasks for repository linkage",
+            "repo": repo,
+        }
+
     developers = [row[0] for row in graph.ro_query("MATCH (d:Developer) RETURN d.name").result_set]
 
     stats: dict[str, Any] = {"status": "processed", "event": event_name, "repo": repo}
@@ -137,7 +158,7 @@ def handle_github_webhook(graph: Any, event_name: str, payload: dict[str, Any]) 
         for path in doc_files_changed:
             try:
                 text = knowledge._raw_file(repo, branch, path)
-            except (GitHubUnavailable, httpx.HTTPError, Exception) as exc:
+            except Exception as exc:
                 log.warning("Could not fetch updated doc %s: %s", path, exc)
                 continue
 
@@ -233,7 +254,7 @@ def handle_github_webhook(graph: Any, event_name: str, payload: dict[str, Any]) 
 
 
 def handle_discord_stream_message(graph: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    """Ingest a live Discord message into the graph in real time."""
+    """Ingest a live Discord message into the graph in real time and extract evidence."""
     message_id = str(payload.get("message_id") or "").strip()
     if not message_id:
         return {"status": "ignored", "reason": "missing message_id"}
@@ -250,44 +271,59 @@ def handle_discord_stream_message(graph: Any, payload: dict[str, Any]) -> dict[s
 
     knowledge.ensure_indexes(graph)
 
-    # 1. Upsert Channel, Message, Author, and relationships
-    upsert_query = """
-    MERGE (c:DiscordChannel {id: $channel_id})
-    SET c.name = $channel_name, c.guild_id = $guild_id, c.guild_name = $guild_name
-    MERGE (m:DiscordMessage {id: $message_id})
-    SET m.channel_id = $channel_id,
-        m.content = $content,
-        m.timestamp = $timestamp,
-        m.source_url = $source_url,
-        m.is_deleted = false
-    MERGE (m)-[:IN_CHANNEL]->(c)
-    MERGE (a:DiscordAuthor {discord_id: $author_id})
-    ON CREATE SET a.name = $author_name
-    SET a.discord_name = $author_name
-    MERGE (a)-[:AUTHORED]->(m)
-    """
-    graph.query(upsert_query, {
-        "channel_id": channel_id,
-        "channel_name": channel_name,
-        "guild_id": guild_id,
-        "guild_name": guild_name,
-        "message_id": message_id,
-        "content": content,
-        "timestamp": timestamp,
-        "source_url": source_url,
-        "author_id": author_id,
-        "author_name": author_name,
-    })
+    # 1. Reuse import_messages so evidence (blocker, decision) is extracted and linked to tasks
+    if DiscordMessage and import_messages:
+        msg = DiscordMessage(
+            id=message_id,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            guild_id=guild_id or None,
+            guild_name=guild_name or None,
+            author_id=author_id,
+            author_name=author_name,
+            content=content,
+            timestamp=timestamp,
+            source_url=source_url,
+        )
+        import_messages(graph, [msg])
+    else:
+        upsert_query = """
+        MERGE (c:DiscordChannel {id: $channel_id})
+        SET c.name = $channel_name, c.guild_id = $guild_id, c.guild_name = $guild_name
+        MERGE (m:DiscordMessage {id: $message_id})
+        SET m.channel_id = $channel_id,
+            m.content = $content,
+            m.timestamp = $timestamp,
+            m.source_url = $source_url,
+            m.is_deleted = false
+        MERGE (m)-[:IN_CHANNEL]->(c)
+        MERGE (a:DiscordAuthor {discord_id: $author_id})
+        ON CREATE SET a.name = $author_name
+        SET a.discord_name = $author_name
+        MERGE (a)-[:AUTHORED]->(m)
+        """
+        graph.query(upsert_query, {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "guild_id": guild_id,
+            "guild_name": guild_name,
+            "message_id": message_id,
+            "content": content,
+            "timestamp": timestamp,
+            "source_url": source_url,
+            "author_id": author_id,
+            "author_name": author_name,
+        })
 
-    # 2. Map author to Developer if match found
+    # 2. Map author to Developer by Discord ID ONLY (no name matching to avoid collisions)
     map_author_query = """
     MATCH (d:Developer)
-    WHERE (d.name = $author_name OR d.discord_id = $author_id)
+    WHERE d.discord_id = $author_id
     MATCH (a:DiscordAuthor {discord_id: $author_id})
     MERGE (a)-[:MAPS_TO]->(d)
     """
     try:
-        graph.query(map_author_query, {"author_name": author_name, "author_id": author_id})
+        graph.query(map_author_query, {"author_id": author_id})
     except Exception as exc:
         log.debug("Developer mapping query skipped: %s", exc)
 
@@ -317,7 +353,7 @@ def handle_discord_message_edit(
     new_content: str,
     edited_at: str | None = None,
 ) -> dict[str, Any]:
-    """Update a Discord message's content and re-evaluate mentioned tasks."""
+    """Update a Discord message's content, re-extract evidence, and re-evaluate mentioned tasks."""
     edited_at = edited_at or _now()
     graph.query(
         "MATCH (m:DiscordMessage {id: $message_id}) "
@@ -325,7 +361,31 @@ def handle_discord_message_edit(
         {"message_id": message_id, "content": new_content, "edited_at": edited_at},
     )
 
-    # Re-link mentioned tasks
+    if DiscordMessage and import_messages:
+        res = graph.query(
+            "MATCH (m:DiscordMessage {id: $message_id}) "
+            "OPTIONAL MATCH (a:DiscordAuthor)-[:AUTHORED]->(m) "
+            "OPTIONAL MATCH (m)-[:IN_CHANNEL]->(c:DiscordChannel) "
+            "RETURN m.channel_id, c.name, c.guild_id, c.guild_name, a.discord_id, a.name, m.timestamp, m.source_url LIMIT 1",
+            {"message_id": message_id},
+        )
+        if res.result_set:
+            row = res.result_set[0]
+            channel_id, channel_name, guild_id, guild_name, author_id, author_name, timestamp, source_url = row
+            msg = DiscordMessage(
+                id=message_id,
+                channel_id=channel_id or "unknown_channel",
+                channel_name=channel_name or "",
+                guild_id=guild_id or None,
+                guild_name=guild_name or None,
+                author_id=author_id or "unknown_author",
+                author_name=author_name or "unknown",
+                content=new_content,
+                timestamp=timestamp or edited_at,
+                source_url=source_url or "",
+            )
+            import_messages(graph, [msg])
+
     tasks = [(row[0], row[1]) for row in graph.ro_query("MATCH (t:Task) RETURN t.id, t.title").result_set]
     mentioned = knowledge.mentioned_tasks(new_content, tasks)
 
@@ -350,17 +410,21 @@ def handle_discord_message_delete(
     message_id: str,
     soft_delete: bool = True,
 ) -> dict[str, Any]:
-    """Soft delete or detach delete a Discord message from the graph."""
+    """Soft delete or detach delete a Discord message and its evidence from the graph."""
     if soft_delete:
         graph.query(
             "MATCH (m:DiscordMessage {id: $message_id}) "
+            "OPTIONAL MATCH (m)-[:SUPPORTS]->(e:ContextEvidence) "
+            "DETACH DELETE e "
             "SET m.is_deleted = true, m.content = '[deleted]'",
             {"message_id": message_id},
         )
         return {"status": "soft_deleted", "message_id": message_id}
     else:
         graph.query(
-            "MATCH (m:DiscordMessage {id: $message_id}) DETACH DELETE m",
+            "MATCH (m:DiscordMessage {id: $message_id}) "
+            "OPTIONAL MATCH (m)-[:SUPPORTS]->(e:ContextEvidence) "
+            "DETACH DELETE e, m",
             {"message_id": message_id},
         )
         return {"status": "deleted", "message_id": message_id}
@@ -411,14 +475,21 @@ def prune_graph_garbage(
         count = sum(row[0] for row in res.result_set) if res.result_set else 0
         stats["pruned_topics"] = count
 
-    # 4. Soft-deleted messages
+    # 4. Soft-deleted messages and orphan evidence
     if prune_deleted_messages:
+        res_e = graph.query(
+            "MATCH (e:ContextEvidence) WHERE NOT ()-[:SUPPORTS]->(e) "
+            "WITH e, count(e) AS cnt DETACH DELETE e RETURN cnt"
+        )
+        orphan_ev = sum(row[0] for row in res_e.result_set) if res_e.result_set else 0
+
         res = graph.query(
             "MATCH (m:DiscordMessage) WHERE m.is_deleted = true "
-            "WITH m, count(m) AS cnt DETACH DELETE m RETURN cnt"
+            "OPTIONAL MATCH (m)-[:SUPPORTS]->(e:ContextEvidence) "
+            "WITH m, e, count(m) AS cnt DETACH DELETE e, m RETURN cnt"
         )
         count = sum(row[0] for row in res.result_set) if res.result_set else 0
-        stats["pruned_deleted_messages"] = count
+        stats["pruned_deleted_messages"] = count + orphan_ev
 
     # 5. Expired messages by retention period
     if max_message_age_days and max_message_age_days > 0:
@@ -443,7 +514,7 @@ class BackgroundKnowledgeSyncer:
         graph_provider: Callable[[], Any],
         default_repo: str,
         interval_seconds: int = DEFAULT_SYNC_INTERVAL,
-        gc_interval_cycles: int = 5,
+        gc_interval_cycles: int = 0,
     ):
         self.graph_provider = graph_provider
         self.default_repo = default_repo
@@ -508,7 +579,7 @@ class BackgroundKnowledgeSyncer:
         except Exception as exc:
             self.total_error_count += 1
             log.exception("Background knowledge sync failed: %s", exc)
-            return {"status": "error", "error": str(exc)}
+            return {"status": "error", "error": "Internal synchronization error"}
 
     async def run_gc(self, max_message_age_days: int | None = None) -> dict[str, Any]:
         """Execute garbage collection directly."""
@@ -527,7 +598,7 @@ class BackgroundKnowledgeSyncer:
             return {"status": "success", "gc": result, "timestamp": self.last_gc_time}
         except Exception as exc:
             log.exception("Garbage collection failed: %s", exc)
-            return {"status": "error", "error": str(exc)}
+            return {"status": "error", "error": "Internal garbage collection error"}
 
     async def _run_loop(self) -> None:
         # Initial brief wait after server boot

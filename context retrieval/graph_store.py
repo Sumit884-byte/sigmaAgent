@@ -340,6 +340,7 @@ def retrieve_evidence(
             WITH task, e, m, author, channel
             WHERE ($channel_id IS NULL OR channel.id = $channel_id)
               AND ($channel_ids IS NULL OR channel.id IN $channel_ids)
+              AND (m.is_deleted IS NULL OR m.is_deleted = false)
             RETURN m.id, m.content, m.timestamp, m.source_url,
                    author.discord_name, channel.id, channel.name,
                    e.kind, e.excerpt, task.id, task.title, 1.0
@@ -357,6 +358,7 @@ def retrieve_evidence(
             """
             CALL db.idx.fulltext.queryNodes('DiscordMessage', $search) YIELD node, score
             WITH node AS m, score
+            WHERE (m.is_deleted IS NULL OR m.is_deleted = false)
             OPTIONAL MATCH (m)-[:SUPPORTS]->(e:ContextEvidence)
             OPTIONAL MATCH (author:DiscordAuthor)-[:AUTHORED]->(m)
             OPTIONAL MATCH (m)-[:IN_CHANNEL]->(channel:DiscordChannel)

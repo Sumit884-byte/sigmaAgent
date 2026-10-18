@@ -21,6 +21,7 @@ from continuous_sync import (
     prune_graph_garbage,
     verify_github_signature,
 )
+import knowledge
 
 # Mock FalkorDB connection for test environment
 with patch.object(falkordb, "FalkorDB", return_value=SimpleNamespace(select_graph=lambda _name: None)):
@@ -237,19 +238,32 @@ class ApiWebhookEndpointTests(unittest.TestCase):
         response = self.client.post("/webhooks/github", json={}, headers=headers)
         self.assertEqual(response.status_code, 401)
 
-    def test_knowledge_sync_status_endpoint(self):
-        response = self.client.get("/knowledge/sync/status")
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertIn("running", data)
-        self.assertIn("total_sync_count", data)
-        self.assertIn("webhook_events_count", data)
+    def test_knowledge_sync_status_endpoint_requires_auth(self):
+        # Unconfigured key fails closed with 503
+        with patch.dict(os.environ, {"INVESTIGATION_API_KEY": ""}):
+            response = self.client.get("/knowledge/sync/status")
+            self.assertEqual(response.status_code, 503)
+
+        # Configured key rejects unauthenticated requests with 401
+        with patch.dict(os.environ, {"INVESTIGATION_API_KEY": "valid-secret-key"}):
+            res_no_auth = self.client.get("/knowledge/sync/status")
+            self.assertEqual(res_no_auth.status_code, 401)
+
+            # Authenticated request succeeds with 200
+            res_auth = self.client.get("/knowledge/sync/status", headers={"Authorization": "Bearer valid-secret-key"})
+            self.assertEqual(res_auth.status_code, 200)
+            data = res_auth.json()
+            self.assertIn("running", data)
+            self.assertIn("total_sync_count", data)
+            self.assertIn("webhook_events_count", data)
 
     @patch("knowledge.sync_repository", return_value={"commits": 5, "issues": 10, "docs": 2})
     @patch("knowledge.refresh_expertise")
     def test_knowledge_sync_run_now_endpoint(self, mock_refresh, mock_sync):
-        with patch.object(api.background_syncer, "graph_provider", return_value=self.mock_graph):
-            response = self.client.post("/knowledge/sync/run-now")
+        with patch.object(api.background_syncer, "graph_provider", return_value=self.mock_graph), \
+             patch.dict(os.environ, {"INVESTIGATION_API_KEY": "valid-secret-key"}):
+            headers = {"Authorization": "Bearer valid-secret-key"}
+            response = self.client.post("/knowledge/sync/run-now", headers=headers)
             self.assertEqual(response.status_code, 200)
             data = response.json()
             self.assertEqual(data["status"], "success")
@@ -360,47 +374,103 @@ class DiscordAndGCApiTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
         self.mock_graph = MockGraph()
+        self.headers = {"Authorization": "Bearer test-internal-key"}
 
-    def test_stream_message_endpoint(self):
-        with patch.object(api, "tenant_graph", return_value=self.mock_graph):
-            payload = {
-                "guild_id": "12345",
-                "channel_id": "chan-1",
-                "message_id": "msg-888",
-                "author_id": "dev-1",
-                "author_name": "Sam",
-                "content": "Check T1 and T2",
-            }
-            res = self.client.post("/discord/stream-message", json=payload)
-            self.assertEqual(res.status_code, 200)
-            self.assertEqual(res.json()["status"], "streamed")
+    def test_stream_message_endpoint_auth(self):
+        # 503 when INVESTIGATION_API_KEY is unset
+        with patch.dict(os.environ, {"INVESTIGATION_API_KEY": ""}):
+            res = self.client.post("/discord/stream-message", json={"channel_id": "c1", "message_id": "m1", "author_id": "a1", "author_name": "Dev", "content": "hello"})
+            self.assertEqual(res.status_code, 503)
+
+        # 401 when INVESTIGATION_API_KEY is configured but request lacks valid key
+        with patch.dict(os.environ, {"INVESTIGATION_API_KEY": "test-internal-key"}):
+            res = self.client.post("/discord/stream-message", json={"channel_id": "c1", "message_id": "m1", "author_id": "a1", "author_name": "Dev", "content": "hello"})
+            self.assertEqual(res.status_code, 401)
+
+            with patch.object(api, "tenant_graph", return_value=self.mock_graph):
+                payload = {
+                    "guild_id": "12345",
+                    "channel_id": "chan-1",
+                    "message_id": "msg-888",
+                    "author_id": "dev-1",
+                    "author_name": "Sam",
+                    "content": "Check T1 and T2",
+                }
+                res = self.client.post("/discord/stream-message", json=payload, headers=self.headers)
+                self.assertEqual(res.status_code, 200)
+                self.assertEqual(res.json()["status"], "streamed")
 
     def test_stream_message_edit_and_delete_endpoints(self):
-        with patch.object(api, "tenant_graph", return_value=self.mock_graph):
-            res_edit = self.client.put("/discord/stream-message/msg-888", json={"content": "new text"})
+        with patch.object(api, "tenant_graph", return_value=self.mock_graph), \
+             patch.dict(os.environ, {"INVESTIGATION_API_KEY": "test-internal-key"}):
+            res_edit = self.client.put("/discord/stream-message/msg-888", json={"content": "new text"}, headers=self.headers)
             self.assertEqual(res_edit.status_code, 200)
             self.assertEqual(res_edit.json()["status"], "updated")
 
-            res_del = self.client.delete("/discord/stream-message/msg-888")
+            res_del = self.client.delete("/discord/stream-message/msg-888", headers=self.headers)
             self.assertEqual(res_del.status_code, 200)
             self.assertEqual(res_del.json()["status"], "soft_deleted")
 
     def test_gc_endpoint_and_status(self):
-        with patch.object(api, "tenant_graph", return_value=self.mock_graph):
-            res = self.client.post("/knowledge/gc", json={"max_message_age_days": 60})
+        with patch.object(api, "tenant_graph", return_value=self.mock_graph), \
+             patch.dict(os.environ, {"INVESTIGATION_API_KEY": "test-internal-key"}):
+            res = self.client.post("/knowledge/gc", json={"max_message_age_days": 60}, headers=self.headers)
             self.assertEqual(res.status_code, 200)
             self.assertEqual(res.json()["status"], "success")
             self.assertIn("stats", res.json())
 
-            res_status = self.client.get("/knowledge/gc/status")
+            res_status = self.client.get("/knowledge/gc/status", headers=self.headers)
             self.assertEqual(res_status.status_code, 200)
             self.assertGreaterEqual(res_status.json()["total_gc_count"], 1)
 
-    def test_run_gc_chat_command(self):
+    def test_run_gc_chat_command_returns_safety_advisory(self):
         with patch.object(api, "tenant_graph", return_value=self.mock_graph):
             res = self.client.post("/investigate", json={"question": "run gc", "discord": {"guild_id": "12345"}})
             self.assertEqual(res.status_code, 200)
-            self.assertIn("Graph Garbage Collection complete", res.json()["answer"])
+            self.assertIn("Garbage collection modifies graph state", res.json()["answer"])
+
+    def test_unmapped_repo_webhook_returns_400(self):
+        with patch.dict(os.environ, {"ALLOW_INSECURE_WEBHOOKS": "true", "REPO_TO_GUILD_MAP": "{}", "DISCORD_GUILD_ID": ""}):
+            payload = {"repository": {"full_name": "unknown-org/unknown-repo"}}
+            headers = {"X-GitHub-Event": "push", "Content-Type": "application/json"}
+            res = self.client.post("/webhooks/github", json=payload, headers=headers)
+            self.assertEqual(res.status_code, 400)
+            self.assertIn("Repository is not mapped", res.json()["detail"])
+
+    def test_webhook_skips_when_graph_has_no_tasks(self):
+        empty_graph = MockGraph()
+        empty_graph.tasks = []
+        payload = {
+            "repository": {"full_name": "Sumit884-byte/sigmaAgent", "default_branch": "main"},
+            "commits": [{"id": "c1", "message": "feat: init"}],
+        }
+        res = handle_github_webhook(empty_graph, "push", payload)
+        self.assertEqual(res["status"], "skipped")
+        self.assertIn("no tasks", res["reason"])
+
+    def test_developer_mapping_uses_discord_id_only(self):
+        # Two users with same name 'Alice' but different discord IDs
+        payload1 = {
+            "channel_id": "c1", "message_id": "m1",
+            "author_id": "alice-id-1", "author_name": "Alice",
+            "content": "Working on T1",
+        }
+        handle_discord_stream_message(self.mock_graph, payload1)
+        map_queries = [q for q, _ in self.mock_graph.queries if "MATCH (d:Developer)" in q]
+        self.assertTrue(any("WHERE d.discord_id = $author_id" in q for q in map_queries))
+        self.assertFalse(any("d.name = $author_name" in q for q in map_queries))
+
+    def test_message_delete_cleans_evidence(self):
+        res = handle_discord_message_delete(self.mock_graph, "msg-evidence-1", soft_delete=True)
+        self.assertEqual(res["status"], "soft_deleted")
+        del_queries = [q for q, _ in self.mock_graph.queries if "DETACH DELETE e" in q]
+        self.assertTrue(len(del_queries) > 0)
+
+    def test_mentioned_tasks_matches_jira_style_keys(self):
+        tasks = [("ENG-123", "Setup infrastructure"), ("T1", "Auth API")]
+        found = knowledge.mentioned_tasks("Fixes ENG-123 and T1 in PR", tasks)
+        self.assertIn("ENG-123", found)
+        self.assertIn("T1", found)
 
 
 if __name__ == "__main__":
