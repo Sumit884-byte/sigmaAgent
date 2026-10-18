@@ -448,6 +448,8 @@ class InvestigateRequest(BaseModel):
     question: str
     # Sent by the Discord bot: guild_id, channel_id, message_id, bot_name, ...
     discord: dict | None = None
+    # Web callers set this explicitly. Requests without Discord provenance are also read-only.
+    read_only: bool = False
 
 
 class SourceItem(BaseModel):
@@ -829,11 +831,12 @@ RETURN d.name, count(DISTINCT c) AS commits, count(DISTINCT i) AS issues, count(
 """.strip()
 
 
-def _expertise_answer(question, guild_id, discord):
+def _expertise_answer(question, guild_id, discord, *, read_only=False):
     """`who knows about X`: people ranked by graph evidence, each with linked proof."""
     if EXPERTS_OVERVIEW_RE.match(question):
         graph = tenant_graph(guild_id)
-        knowledge.refresh_expertise(graph)
+        if not read_only:
+            knowledge.refresh_expertise(graph)
         overview = knowledge.experts_overview(graph)
         if not overview:
             return ("I don't have enough evidence for who knows what yet. "
@@ -1860,16 +1863,22 @@ def _direct_task_command_answer(question, guild_id, discord):
 def investigate(req: InvestigateRequest):
 
     discord = req.discord or {}
+    read_only = req.read_only or not discord
     if HELP_RE.match(req.question):
         return _format_investigate_response(HELP_TEXT)
+    if read_only and re.match(r"^\s*sync\b", req.question, re.IGNORECASE):
+        return _format_investigate_response(
+            "This workspace is read-only and cannot sync repositories. Use the authenticated administration endpoint instead."
+        )
     # Requests from outside Discord (e.g. curl) use the default server
     server_id = discord.get("guild_id") if req.discord else os.getenv("DISCORD_GUILD_ID")
     if server_id:
-        for command in (_sync_answer, _teams_answer, _gc_answer):
+        commands = (_teams_answer, _gc_answer) if read_only else (_sync_answer, _teams_answer, _gc_answer)
+        for command in commands:
             command_answer = command(req.question, server_id)
             if command_answer is not None:
                 return _format_investigate_response(command_answer)
-        expertise_answer = _expertise_answer(req.question, server_id, discord)
+        expertise_answer = _expertise_answer(req.question, server_id, discord, read_only=read_only)
         if expertise_answer is not None:
             return _format_investigate_response(expertise_answer)
     # Repository questions don't depend on a server's task graph, so answer them next
@@ -1893,7 +1902,9 @@ def investigate(req: InvestigateRequest):
     ownership_answer = _ownership_provenance_answer(req.question, guild_id, tasks)
     if ownership_answer is not None:
         return _format_investigate_response(ownership_answer)
-    task_command_answer = _direct_task_command_answer(req.question, guild_id, discord)
+    task_command_answer = _direct_task_command_answer(
+        req.question, guild_id, {} if read_only else discord
+    )
     if task_command_answer is not None:
         return _format_investigate_response(task_command_answer)
     gemini = _gemini_client()
@@ -1909,6 +1920,10 @@ def investigate(req: InvestigateRequest):
         except Exception as exc:
             print(f"Gemini request failed, using rule-based answer: {exc}")
         else:
+            if read_only and reply.changes:
+                return _format_investigate_response(
+                    "This workspace is read-only, so I didn't make any changes. Ask a question about the current work instead."
+                )
             applied, lines = [], []
             provenance = _discord_provenance(discord, guild_id, req.question)
             for index, change in enumerate(reply.changes):
